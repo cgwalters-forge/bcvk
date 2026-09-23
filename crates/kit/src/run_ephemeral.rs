@@ -531,6 +531,13 @@ pub struct RunEphemeralOpts {
     #[clap(long, help = "Allocate a swap device of the provided size")]
     pub add_swap: Option<String>,
 
+    /// Size of the ephemeral /var tmpfs, e.g. 10G or 75% (default: 50% of memory)
+    ///
+    /// Data written to /var uses guest RAM, so for sizes near or above
+    /// `--memory` also pass `--add-swap`.
+    #[clap(long, value_name = "SIZE", value_parser = parse_var_size)]
+    pub var_size: Option<String>,
+
     #[clap(
         long = "mount-disk-file",
         value_name = "FILE[:NAME]",
@@ -552,6 +559,29 @@ pub struct RunEphemeralOpts {
     #[clap(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_dns_servers: Option<Vec<String>>,
+}
+
+/// Validate a `--var-size` value and convert it to a tmpfs `size=` option.
+///
+/// Sizes are normalized to bytes; percentages (of guest memory) are passed
+/// through. The result is embedded in a systemd unit and a mount option
+/// string, so anything else is rejected.
+pub(crate) fn parse_var_size(s: &str) -> Result<String> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        let pct: u32 = pct
+            .parse()
+            .map_err(|_| eyre!("Invalid percentage in /var size: {s:?}"))?;
+        if pct == 0 {
+            return Err(eyre!("/var size must be greater than zero"));
+        }
+        return Ok(format!("{pct}%"));
+    }
+    let bytes = utils::parse_size(s).with_context(|| format!("Invalid /var size: {s:?}"))?;
+    if bytes == 0 {
+        return Err(eyre!("/var size must be greater than zero"));
+    }
+    Ok(bytes.to_string())
 }
 
 /// Parse DNS servers from resolv.conf format content
@@ -1420,7 +1450,7 @@ pub(crate) async fn run_impl(opts: RunEphemeralOpts) -> Result<()> {
     // proper alignment. The kernel skips NUL bytes between archives.
     {
         use std::io::{Seek, SeekFrom, Write};
-        let cpio_data = crate::cpio::create_initramfs_units_cpio()
+        let cpio_data = crate::cpio::create_initramfs_units_cpio(opts.var_size.as_deref())
             .map_err(|e| eyre!("Failed to create initramfs CPIO: {e}"))?;
         let mut initramfs_file = fs::OpenOptions::new()
             .append(true)
@@ -2140,6 +2170,38 @@ Options=
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_var_size() {
+        let valid = [
+            ("10G", "10737418240"),
+            ("512M", "536870912"),
+            (" 2g ", "2147483648"),
+            ("4096", "4096"),
+            ("75%", "75%"),
+            ("200%", "200%"),
+        ];
+        for (input, expected) in valid {
+            assert_eq!(parse_var_size(input).unwrap(), expected, "input {input:?}");
+        }
+
+        // Anything that could smuggle extra mount options or unit syntax must fail
+        let invalid = [
+            "",
+            "0",
+            "0%",
+            "%",
+            "-1G",
+            "1.5G",
+            "abc",
+            "10G,exec",
+            "50%\nX=y",
+            "99999999999T",
+        ];
+        for input in invalid {
+            assert!(parse_var_size(input).is_err(), "input {input:?}");
+        }
+    }
 
     #[test]
     fn test_journal_json_to_text() {

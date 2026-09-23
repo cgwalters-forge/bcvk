@@ -35,8 +35,22 @@ enum Entry {
     File(&'static str, &'static [u8]),
 }
 
+/// Directory for drop-ins overriding `bcvk-var-ephemeral.service`.
+const VAR_EPHEMERAL_DROPIN_DIR: &str = "usr/lib/systemd/system/bcvk-var-ephemeral.service.d";
+
+/// Render the drop-in that sets the size of the ephemeral `/var` tmpfs.
+///
+/// `size` must already be a validated tmpfs `size=` value (see
+/// `run_ephemeral::parse_var_size`).
+fn var_size_dropin(size: &str) -> String {
+    format!("[Service]\nEnvironment=BCVK_VAR_SIZE={size}\n")
+}
+
 /// Create a CPIO archive with bcvk initramfs units for ephemeral VM setup.
-pub fn create_initramfs_units_cpio() -> io::Result<Vec<u8>> {
+///
+/// If `var_size` is set, the ephemeral `/var` tmpfs is sized accordingly
+/// instead of using the default from `bcvk-var-ephemeral.service`.
+pub fn create_initramfs_units_cpio(var_size: Option<&str>) -> io::Result<Vec<u8>> {
     use Entry::*;
 
     const UNIT_DIR: &str = "usr/lib/systemd/system";
@@ -117,6 +131,14 @@ pub fn create_initramfs_units_cpio() -> io::Result<Vec<u8>> {
             File(path, content) => write_file(&mut buf, path, content)?,
         }
     }
+    if let Some(size) = var_size {
+        write_directory(&mut buf, VAR_EPHEMERAL_DROPIN_DIR)?;
+        write_file(
+            &mut buf,
+            &format!("{VAR_EPHEMERAL_DROPIN_DIR}/bcvk-var-size.conf"),
+            var_size_dropin(size).as_bytes(),
+        )?;
+    }
 
     cpio::newc::trailer(buf)
 }
@@ -128,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_cpio_archive_structure_and_contents() {
-        let cpio_data = create_initramfs_units_cpio().unwrap();
+        let cpio_data = create_initramfs_units_cpio(None).unwrap();
         let mut cursor = Cursor::new(cpio_data);
 
         let mut entries = Vec::new();
@@ -233,5 +255,53 @@ mod tests {
         assert!(content.contains("[Unit]"));
         assert!(content.contains("[Service]"));
         assert!(content.contains("overlay"));
+    }
+
+    /// Read every entry of a CPIO archive into (name, contents) pairs.
+    fn read_cpio(data: Vec<u8>) -> Vec<(String, Vec<u8>)> {
+        let mut cursor = Cursor::new(data);
+        let mut out = Vec::new();
+        loop {
+            let mut reader = cpio::NewcReader::new(cursor).expect("failed to read CPIO entry");
+            if reader.entry().is_trailer() {
+                return out;
+            }
+            let name = reader.entry().name().to_string();
+            let mut content = Vec::new();
+            reader
+                .read_to_end(&mut content)
+                .expect("failed to read file content");
+            out.push((name, content));
+            cursor = reader.finish().expect("failed to finish entry");
+        }
+    }
+
+    #[test]
+    fn test_cpio_var_size_dropin() {
+        let dropin = format!("{VAR_EPHEMERAL_DROPIN_DIR}/bcvk-var-size.conf");
+
+        let default = read_cpio(create_initramfs_units_cpio(None).unwrap());
+        assert!(
+            !default
+                .iter()
+                .any(|(name, _)| name.starts_with(VAR_EPHEMERAL_DROPIN_DIR)),
+            "no /var size drop-in expected without --var-size"
+        );
+
+        let sized = read_cpio(create_initramfs_units_cpio(Some("10737418240")).unwrap());
+        let (_, content) = sized
+            .iter()
+            .find(|(name, _)| *name == dropin)
+            .expect("/var size drop-in missing");
+        assert_eq!(
+            std::str::from_utf8(content).unwrap(),
+            "[Service]\nEnvironment=BCVK_VAR_SIZE=10737418240\n"
+        );
+        assert!(
+            sized
+                .iter()
+                .any(|(name, _)| name == VAR_EPHEMERAL_DROPIN_DIR),
+            "drop-in directory must be created"
+        );
     }
 }
