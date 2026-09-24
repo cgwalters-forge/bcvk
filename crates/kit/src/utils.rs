@@ -203,7 +203,9 @@ pub(crate) fn parse_size(size_str: &str) -> Result<u64> {
         .parse()
         .map_err(|_| eyre!("Invalid number in size: {}", number_str))?;
 
-    Ok(number * multiplier)
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| eyre!("Size too large: {size_str}"))
 }
 
 /// Parse a memory string (like "2G", "1024M", "512") to megabytes
@@ -247,4 +249,42 @@ pub(crate) fn parse_memory_to_mb(memory_str: &str) -> Result<u32> {
     let total_mb = (number * bytes_per_unit) / mib;
 
     Ok(total_mb as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_size() {
+        let valid = [
+            ("0", 0),
+            ("4096", 4096),
+            ("512B", 512),
+            ("1k", 1024),
+            ("1KB", 1024),
+            ("5120M", 5120 << 20),
+            (" 10g ", 10 << 30),
+            ("1TB", 1 << 40),
+            ("16777215T", 16777215 << 40),
+        ];
+        for (input, expected) in valid {
+            assert_eq!(parse_size(input).unwrap(), expected, "input {input:?}");
+        }
+
+        // Overflowing sizes must be rejected rather than wrapping around
+        let invalid = [
+            "",
+            "abc",
+            "-1G",
+            "1.5G",
+            "10X",
+            "99999999999T",
+            "17179869184G",
+            "18446744073709551616",
+        ];
+        for input in invalid {
+            assert!(parse_size(input).is_err(), "input {input:?}");
+        }
+    }
 }
