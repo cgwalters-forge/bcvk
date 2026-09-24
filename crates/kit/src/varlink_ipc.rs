@@ -382,6 +382,8 @@ impl BcvkService {
                 },
             };
 
+            // On an install failure, the path of the saved VM logs is printed
+            // to this server's stderr, not returned to the client.
             let outcome = crate::to_disk::run(opts)?;
             let cached = outcome == crate::to_disk::RunOutcome::Cached;
 

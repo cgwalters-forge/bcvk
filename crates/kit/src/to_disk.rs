@@ -77,7 +77,10 @@ use std::io::IsTerminal;
 
 use crate::cache_metadata::DiskImageMetadata;
 use crate::install_options::InstallOptions;
-use crate::run_ephemeral::{run_detached, CommonVmOpts, RunEphemeralOpts};
+use crate::run_ephemeral::{
+    host_mount_virtiofsd_log, run_detached, CommonVmOpts, RunEphemeralOpts,
+    HOST_STORAGE_MOUNT_NAME, ROOTFS_VIRTIOFSD_LOG,
+};
 use crate::run_ephemeral_ssh::wait_for_ssh_ready;
 use crate::{images, ssh, utils};
 use camino::Utf8PathBuf;
@@ -86,8 +89,21 @@ use color_eyre::eyre::{eyre, Context};
 use color_eyre::Result;
 use indicatif::HumanDuration;
 use indoc::indoc;
+use std::io::Write;
+use std::time::Duration;
 use tempfile::TempDir;
 use tracing::debug;
+
+/// If set (to anything non-empty), a failed install also prints the tails of
+/// the install VM's logs to stderr, rather than only saving them to a file.
+/// The integration tests set this so the logs end up in CI output.
+pub const PRINT_FAILURE_LOGS_ENV: &str = "BCVK_PRINT_FAILURE_LOGS";
+
+/// How many trailing lines of each log to print when an install fails.
+const FAILURE_LOG_MAX_LINES: usize = 200;
+
+/// How long to wait for the guest to answer when fetching its kernel log.
+const FAILURE_DMESG_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Supported disk image formats
 #[derive(Debug, Clone, ValueEnum, PartialEq, Default)]
@@ -523,6 +539,7 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
     let bootc_install_command = opts.generate_bootc_install_command(disk_size)?;
 
     // Phase 4: Ephemeral VM configuration
+    let debug_requested = opts.additional.common.debug;
     let mut common_opts = opts.additional.common.clone();
     // Enable SSH key generation for SSH-based installation
     common_opts.ssh_keygen = true;
@@ -615,6 +632,11 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         Ok(())
     })();
 
+    // The VM's logs live only in the container, so grab them before it's gone.
+    if result.is_err() {
+        save_failure_diagnostics(&container_id, debug_requested);
+    }
+
     // Cleanup: stop and remove the container
     debug!("Cleaning up ephemeral container...");
     let _ = std::process::Command::new("podman")
@@ -642,6 +664,139 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
             let _ = std::fs::remove_file(&opts.target_disk);
             Err(e)
         }
+    }
+}
+
+/// Format the last `max_lines` lines of `content` as a block headed by `title`,
+/// noting how many lines were left out.
+fn format_log_tail(title: &str, content: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let omitted = lines.len().saturating_sub(max_lines);
+    let mut out = if omitted > 0 {
+        format!(
+            "----- {title} (last {max_lines} of {} lines) -----\n",
+            lines.len()
+        )
+    } else {
+        format!("----- {title} -----\n")
+    };
+    if lines.is_empty() {
+        out.push_str("(empty)\n");
+    }
+    for line in &lines[omitted..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Read a file inside the (still running) ephemeral container.
+fn read_container_file(container_id: &str, path: &str) -> Result<String> {
+    let output = std::process::Command::new("podman")
+        .args(["exec", "--", container_id, "cat", "--", path])
+        .output()
+        .context("Failed to run podman exec")?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "podman exec cat {path} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Read the guest kernel log over SSH.
+fn read_guest_dmesg(container_id: &str) -> Result<String> {
+    let output = ssh::connect_captured(
+        container_id,
+        vec!["dmesg".to_string()],
+        Some(FAILURE_DMESG_TIMEOUT),
+    )?;
+    if output.exit_code != 0 {
+        return Err(eyre!(
+            "dmesg exited with code {}: {}",
+            output.exit_code,
+            output.stderr.trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Collect the guest kernel log and the virtiofsd logs from the install VM.
+/// These are the main evidence for failures like I/O errors on the host
+/// storage share (e.g. <https://github.com/bootc-dev/bcvk/issues/157>), and
+/// are otherwise removed along with the container.
+fn collect_failure_diagnostics(container_id: &str) -> Vec<(String, Result<String>)> {
+    let host_storage_log = host_mount_virtiofsd_log(HOST_STORAGE_MOUNT_NAME);
+    vec![
+        (
+            "guest kernel log (dmesg)".to_string(),
+            read_guest_dmesg(container_id),
+        ),
+        (
+            format!("virtiofsd log for host storage ({host_storage_log})"),
+            read_container_file(container_id, &host_storage_log),
+        ),
+        (
+            format!("virtiofsd log for root filesystem ({ROOTFS_VIRTIOFSD_LOG})"),
+            read_container_file(container_id, ROOTFS_VIRTIOFSD_LOG),
+        ),
+    ]
+}
+
+/// Format collected logs, keeping the last `max_lines` lines of each. A log
+/// that couldn't be read is reported in its place.
+fn format_failure_diagnostics(logs: &[(String, Result<String>)], max_lines: usize) -> String {
+    logs.iter()
+        .map(|(title, content)| match content {
+            Ok(content) => format_log_tail(title, content, max_lines),
+            Err(e) => format!("----- {title}: unavailable: {e:#}\n"),
+        })
+        .collect()
+}
+
+/// Write `contents` to a new file in the temporary directory, which is kept,
+/// and return its path.
+fn write_failure_log(contents: &str) -> Result<Utf8PathBuf> {
+    let mut file = tempfile::Builder::new()
+        .prefix("bcvk-to-disk-failure-")
+        .suffix(".log")
+        .tempfile()
+        .context("Creating log file")?;
+    file.write_all(contents.as_bytes())
+        .context("Writing log file")?;
+    let (_, path) = file.keep().context("Keeping log file")?;
+    Utf8PathBuf::from_path_buf(path).map_err(|p| eyre!("Non-UTF-8 log file path: {p:?}"))
+}
+
+/// Save the install VM's logs to a file after a failed install, and print
+/// its path. The tails of the logs are also printed to stderr with `--debug`,
+/// debug logging, or [`PRINT_FAILURE_LOGS_ENV`] set, or if the file can't be
+/// written. Best effort: this never fails.
+fn save_failure_diagnostics(container_id: &str, debug_requested: bool) {
+    let logs = collect_failure_diagnostics(container_id);
+    if logs.iter().all(|(_, content)| content.is_err()) {
+        // Most likely the VM never came up; nothing worth pointing at.
+        for (title, content) in &logs {
+            if let Err(e) = content {
+                debug!("Install VM {title} unavailable: {e:#}");
+            }
+        }
+        return;
+    }
+    let print = debug_requested
+        || tracing::enabled!(tracing::Level::DEBUG)
+        || std::env::var_os(PRINT_FAILURE_LOGS_ENV).is_some_and(|v| !v.is_empty());
+    let saved = write_failure_log(&format_failure_diagnostics(&logs, usize::MAX));
+    match &saved {
+        Ok(path) => eprintln!("Logs from the failed install VM were saved to {path}"),
+        Err(e) => eprintln!("Failed to save logs from the failed install VM: {e:#}"),
+    }
+    if print || saved.is_err() {
+        eprint!(
+            "{}",
+            format_failure_diagnostics(&logs, FAILURE_LOG_MAX_LINES)
+        );
     }
 }
 
@@ -724,6 +879,45 @@ mod tests {
         assert_eq!(size2, 5120 * 1024 * 1024);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_format_log_tail() {
+        let cases = [
+            ("", 3, "----- t -----\n(empty)\n"),
+            ("a\nb", 3, "----- t -----\na\nb\n"),
+            ("a\nb\nc\n", 3, "----- t -----\na\nb\nc\n"),
+            (
+                "a\nb\nc\nd\ne\n",
+                2,
+                "----- t (last 2 of 5 lines) -----\nd\ne\n",
+            ),
+            ("a\r\nb\r\n", 3, "----- t -----\na\nb\n"),
+            ("a\nb\n", 0, "----- t (last 0 of 2 lines) -----\n"),
+        ];
+        for (content, max_lines, expected) in cases {
+            assert_eq!(
+                format_log_tail("t", content, max_lines),
+                expected,
+                "content={content:?} max_lines={max_lines}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_failure_diagnostics() {
+        let logs = vec![
+            ("a".to_string(), Ok("1\n2\n".to_string())),
+            ("b".to_string(), Err(eyre!("gone"))),
+        ];
+        assert_eq!(
+            format_failure_diagnostics(&logs, 1),
+            "----- a (last 1 of 2 lines) -----\n2\n----- b: unavailable: gone\n"
+        );
+        assert_eq!(
+            format_failure_diagnostics(&logs, usize::MAX),
+            "----- a -----\n1\n2\n----- b: unavailable: gone\n"
+        );
     }
 
     /// Clap parses `--flag=--value` by treating everything after `=` as the raw
