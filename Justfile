@@ -2,6 +2,8 @@ PRIMARY_IMAGE := "quay.io/centos-bootc/centos-bootc:stream10"
 # TODO: Readd quay.io/almalinuxorg/almalinux-bootc:9.6 here after debugging
 # <https://github.com/bootc-dev/bcvk/issues/153>
 ALL_BASE_IMAGES := "quay.io/fedora/fedora-bootc:43 quay.io/fedora/fedora-bootc:44 quay.io/centos-bootc/centos-bootc:stream9 quay.io/centos-bootc/centos-bootc:stream10 quay.io/almalinuxorg/almalinux-bootc:10.0"
+# Used by the Ignition tests, via BCVK_FCOS_IMAGE
+FCOS_IMAGE := "quay.io/fedora/fedora-coreos:stable"
 
 # Build the native binary
 build:
@@ -21,8 +23,26 @@ unit *ARGS:
         cargo test {{ ARGS }}
     fi
 
+# Pull all images used by the integration tests. Registries (notably quay.io)
+# regularly return 5xx or drop connections mid-blob, and podman's own retries
+# don't cover all of those, so retry each image with exponential backoff.
 pull-test-images:
-    podman pull -q {{ALL_BASE_IMAGES}} >/dev/null
+    #!/usr/bin/env bash
+    set -euo pipefail
+    attempts=5
+    for image in {{ ALL_BASE_IMAGES }} {{ FCOS_IMAGE }}; do
+        delay=15
+        for ((i = 1; ; i++)); do
+            podman pull -q "$image" >/dev/null && break
+            if ((i >= attempts)); then
+                echo "error: failed to pull $image after $attempts attempts" >&2
+                exit 1
+            fi
+            echo "warning: pulling $image failed (attempt $i/$attempts), retrying in ${delay}s" >&2
+            sleep "$delay"
+            delay=$((delay * 2))
+        done
+    done
 
 # Run integration tests (prefers cargo-nextest, falls back to cargo test with
 # built-in fork-exec output capture)
@@ -33,6 +53,7 @@ test-integration *ARGS: build pull-test-images
     export BCVK_PRIMARY_IMAGE={{ PRIMARY_IMAGE }}
     # Note: BCVK_ALL_IMAGES is quoted to preserve the space-separated list
     export BCVK_ALL_IMAGES="{{ ALL_BASE_IMAGES }}"
+    export BCVK_FCOS_IMAGE={{ FCOS_IMAGE }}
 
     # Clean up any leftover containers before starting
     cargo run --release --bin test-cleanup -p integration-tests 2>/dev/null || true
