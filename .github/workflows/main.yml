@@ -168,6 +168,7 @@ jobs:
         run: |
           echo "PRIMARY_IMAGE=$(just --evaluate PRIMARY_IMAGE)" >> $GITHUB_ENV
           echo "ALL_BASE_IMAGES=$(just --evaluate ALL_BASE_IMAGES)" >> $GITHUB_ENV
+          echo "FCOS_IMAGE=$(just --evaluate FCOS_IMAGE)" >> $GITHUB_ENV
 
       - name: Setup Rust
         uses: bootc-dev/actions/setup-rust@main
@@ -205,6 +206,7 @@ jobs:
           BCVK_PATH: ${{ github.workspace }}/target/release/bcvk
           BCVK_PRIMARY_IMAGE: ${{ env.PRIMARY_IMAGE }}
           BCVK_ALL_IMAGES: ${{ env.ALL_BASE_IMAGES }}
+          BCVK_FCOS_IMAGE: ${{ env.FCOS_IMAGE }}
 
       - name: Upload junit XML
         if: always()
