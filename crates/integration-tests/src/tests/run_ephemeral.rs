@@ -462,9 +462,45 @@ fn test_run_ephemeral_mount_layout() -> TestResult {
         var_fstype
     );
 
+    // /var must be its own tmpfs, not a directory on /run's
+    let var_source = cmd!(
+        sh,
+        "{bck} ephemeral run --rm --label {label} --execute 'findmnt -n -o SOURCE /var' {image}"
+    )
+    .read()?;
+    assert_eq!(
+        var_source.trim(),
+        "bcvk-var",
+        "/var should be the dedicated bcvk-var tmpfs, got: {}",
+        var_source
+    );
+
     Ok(())
 }
 integration_test!(test_run_ephemeral_mount_layout);
+
+/// Test that --var-size sets the size of the ephemeral /var tmpfs
+fn test_run_ephemeral_var_size() -> TestResult {
+    let sh = shell()?;
+    let bck = get_bck_command()?;
+    let image = get_test_image();
+    let label = INTEGRATION_TEST_LABEL;
+
+    let var_size = cmd!(
+        sh,
+        "{bck} ephemeral run --rm --label {label} --var-size 3G --execute 'findmnt -n -b -o SIZE /var' {image}"
+    )
+    .read()?;
+    assert_eq!(
+        var_size.trim(),
+        (3u64 << 30).to_string(),
+        "/var should be sized by --var-size, got: {}",
+        var_size
+    );
+
+    Ok(())
+}
+integration_test!(test_run_ephemeral_var_size);
 
 /// Verify that systemd ordering cycle detection actually works by injecting
 /// a deliberate cycle: unit A Before=B, unit B Before=A.

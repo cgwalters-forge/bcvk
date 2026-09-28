@@ -564,6 +564,7 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         // Basically containers-libs allocates a tempfile for a whole serialization of a layer as a tarball
         // when fetching, so we need enough memory to do so.
         add_swap: Some(format!("{disk_size}")),
+        var_size: None,
         bind_mounts: Vec::new(),    // No additional bind mounts needed
         ro_bind_mounts: Vec::new(), // No additional ro bind mounts needed
         systemd_units_dir: Some(units_dir.path().to_string_lossy().to_string()),

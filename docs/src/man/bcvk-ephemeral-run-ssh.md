@@ -156,6 +156,10 @@ For longer-running VMs where you need to reconnect multiple times, use
 
     Allocate a swap device of the provided size
 
+**--var-size**=*SIZE*
+
+    Size of the ephemeral /var tmpfs, e.g. 10G or 75% (default: 50% of memory)
+
 **--mount-disk-file**=*FILE[:NAME]*
 
     Mount disk file as virtio-blk device at /dev/disk/by-id/virtio-<name>

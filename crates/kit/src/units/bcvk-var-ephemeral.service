@@ -10,6 +10,12 @@ Requires=sysroot.mount
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=60
+# /var gets its own tmpfs rather than living on /run, which systemd caps at
+# 20% of RAM and which must not be filled up by guest workloads. The default
+# of 50% matches the kernel's tmpfs default; it is set explicitly here so that
+# the drop-in bcvk generates for --var-size can override it.
+Environment=BCVK_VAR_SIZE=50%
 ExecStart=/usr/bin/mkdir -p /run/var-ephemeral
+ExecStart=/usr/bin/mount -t tmpfs -o mode=0755,size=${BCVK_VAR_SIZE} bcvk-var /run/var-ephemeral
 ExecStart=/usr/bin/cp -a /sysroot/var/. /run/var-ephemeral/
 ExecStart=/usr/bin/mount --bind /run/var-ephemeral /sysroot/var

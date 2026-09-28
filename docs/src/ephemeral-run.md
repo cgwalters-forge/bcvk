@@ -22,6 +22,19 @@ bcvk ephemeral run-ssh quay.io/fedora/fedora-bootc:42
 bcvk ephemeral run --memory 4096 --cpus 4 --name myvm quay.io/fedora/fedora-bootc:42
 ```
 
+The VM's `/var` is a tmpfs, so anything written there (such as container
+images pulled by podman or a quadlet) lives in guest memory. It defaults to
+50% of guest RAM (`--memory`; swap is not counted). Use `--var-size` to
+change that, with either a size or a percentage of guest RAM. Filling a
+`/var` that is larger than the memory available to hold it leads to the
+guest running out of memory rather than a clean "No space left on device"
+error, so for large workloads also raise `--memory` or add swap with
+`--add-swap`:
+
+```bash
+bcvk ephemeral run-ssh --memory 8G --add-swap 10G --var-size 10G quay.io/fedora/fedora-bootc:42
+```
+
 ## Detecting an ephemeral environment
 
 Conceptually now with `bcvk ephemeral`, there's *four* different ways to run

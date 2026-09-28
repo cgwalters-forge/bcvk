@@ -273,6 +273,7 @@ impl BcvkService {
                 systemd_units_dir: None,
                 bind_storage_ro: false,
                 add_swap: opts.add_swap,
+                var_size: None,
                 mount_disk_files: opts.mount_disk_files.unwrap_or_default(),
                 kernel_args: opts.kargs.unwrap_or_default(),
                 ignition_config: None,
