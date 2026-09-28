@@ -1,10 +1,15 @@
 //! SSH integration for bcvk VMs
 
 use camino::{Utf8Path, Utf8PathBuf};
-use color_eyre::{eyre::eyre, Result};
+use color_eyre::{
+    eyre::{eyre, Context},
+    Result,
+};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::CONTAINER_STATEDIR;
@@ -178,7 +183,6 @@ pub fn connect(
 
 /// Result of running an SSH command with captured output.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct CapturedSshOutput {
     /// Process exit code (-1 if terminated by signal)
     pub exit_code: i32,
@@ -188,12 +192,21 @@ pub struct CapturedSshOutput {
     pub stderr: String,
 }
 
+/// How often [`connect_captured`] checks whether the SSH command has exited.
+const CAPTURED_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Execute an SSH command inside a container, capturing stdout and stderr.
 ///
 /// Like [`connect`] but returns the output instead of passing it through
-/// to the terminal. Intended for programmatic/IPC use.
-#[allow(dead_code)]
-pub fn connect_captured(container_name: &str, args: Vec<String>) -> Result<CapturedSshOutput> {
+/// to the terminal. Intended for programmatic/IPC use. If `timeout` is set
+/// and the command hasn't finished by then, it is killed and an error is
+/// returned; this matters when the guest may be wedged. Note that only the
+/// local `podman exec` is killed, so the remote command may keep running.
+pub fn connect_captured(
+    container_name: &str,
+    args: Vec<String>,
+    timeout: Option<Duration>,
+) -> Result<CapturedSshOutput> {
     debug!("Executing captured SSH in container: {}", container_name);
 
     verify_container_running(container_name)?;
@@ -204,16 +217,48 @@ pub fn connect_captured(container_name: &str, args: Vec<String>) -> Result<Captu
         common: CommonSshOptions::default(),
     };
     let mut cmd = build_podman_ssh_command(container_name, &args, &options)?;
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Capture into anonymous files rather than pipes, so that we can poll for
+    // exit without the child blocking on a full pipe.
+    let mut stdout = tempfile::tempfile().context("Creating temporary file for SSH stdout")?;
+    let mut stderr = tempfile::tempfile().context("Creating temporary file for SSH stderr")?;
+    cmd.stdin(Stdio::null())
+        .stdout(stdout.try_clone().context("Duplicating SSH stdout file")?)
+        .stderr(stderr.try_clone().context("Duplicating SSH stderr file")?);
 
-    let output = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| eyre!("Failed to execute SSH command: {}", e))?;
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("Waiting for SSH command to exit")?
+        {
+            break status;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            // Best effort; the command is abandoned either way.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(eyre!(
+                "SSH command {args:?} timed out after {}s",
+                timeout.unwrap_or_default().as_secs()
+            ));
+        }
+        std::thread::sleep(CAPTURED_POLL_INTERVAL);
+    };
 
+    let read_all = |f: &mut fs::File| -> Result<String> {
+        let mut buf = Vec::new();
+        f.seek(SeekFrom::Start(0))
+            .and_then(|_| f.read_to_end(&mut buf))
+            .context("Reading captured SSH output")?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    };
     Ok(CapturedSshOutput {
-        exit_code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: status.code().unwrap_or(-1),
+        stdout: read_all(&mut stdout)?,
+        stderr: read_all(&mut stderr)?,
     })
 }
 

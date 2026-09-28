@@ -200,6 +200,12 @@ fn test_images_list() -> itest::TestResult {
 integration_test!(test_images_list);
 
 fn main() {
+    // Have bcvk print the install VM logs to stderr when a to-disk install
+    // fails (see BCVK_PRINT_FAILURE_LOGS in to_disk.rs), so they end up in the
+    // test output and CI junit reports instead of a file on the runner. This
+    // runs before any threads are spawned.
+    std::env::set_var("BCVK_PRINT_FAILURE_LOGS", "1");
+
     let config = itest::TestConfig {
         report_name: "bcvk-integration-tests".into(),
         suite_name: "integration".into(),

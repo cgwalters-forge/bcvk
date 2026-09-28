@@ -84,6 +84,16 @@ podman ps | grep test-vm
 podman logs test-vm
 ```
 
+### Failed `to-disk` installs
+
+When `bootc install` fails inside the `to-disk` VM (this includes base disk
+creation for `bcvk libvirt run`), bcvk saves the guest kernel log and the
+virtiofsd logs to a `bcvk-to-disk-failure-*.log` file in the temporary
+directory and prints its path. To also get the last 200 lines of each log on
+stderr, pass `--debug`, enable debug logging, or set
+`BCVK_PRINT_FAILURE_LOGS=1`. The integration tests set that variable, so the
+logs show up in the output of a failing test.
+
 ## Coverage
 
 ```bash
