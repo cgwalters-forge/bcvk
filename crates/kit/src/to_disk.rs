@@ -552,6 +552,8 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
     let ephemeral_opts = RunEphemeralOpts {
         host_dns_servers: None,
         image: opts.get_installer_image().to_string(),
+        // The source was already inspected (and prepared by libvirt run, if used).
+        pull: crate::podman::PullPolicy::Never,
         common: common_opts,
         podman: crate::run_ephemeral::CommonPodmanOptions {
             rm: true,     // Clean up container after installation

@@ -203,6 +203,10 @@ pub struct LibvirtRunOpts {
     /// Container image to run as a bootable VM
     pub image: String,
 
+    /// When to pull the source image from its registry.
+    #[clap(long, value_enum, default_value = "missing")]
+    pub pull: crate::podman::PullPolicy,
+
     /// Name for the VM (auto-generated if not specified)
     #[clap(long)]
     pub name: Option<String>,
@@ -439,6 +443,12 @@ pub fn run(global_opts: &crate::libvirt::LibvirtOptions, mut opts: LibvirtRunOpt
         }
     }
 
+    // Resolve the source before inspecting it or removing a VM for --replace.
+    crate::podman::prepare_image(&opts.image, opts.pull)?;
+    let inspect = images::inspect(&opts.image)?;
+    let image_digest = inspect.digest.to_string();
+    debug!("Image digest: {}", image_digest);
+
     let connect_uri = global_opts.connect.as_deref();
     let lister = match global_opts.connect.as_ref() {
         Some(uri) => DomainLister::with_connection(uri.clone()),
@@ -477,11 +487,6 @@ pub fn run(global_opts: &crate::libvirt::LibvirtOptions, mut opts: LibvirtRunOpt
         "Creating libvirt domain '{}' (install source container image: {})",
         vm_name, opts.image
     );
-
-    // Get the image digest for caching
-    let inspect = images::inspect(&opts.image)?;
-    let image_digest = inspect.digest.to_string();
-    debug!("Image digest: {}", image_digest);
 
     // Check Ignition support and validate config file path early
     if let Some(ref ignition_path) = opts.ignition_config {

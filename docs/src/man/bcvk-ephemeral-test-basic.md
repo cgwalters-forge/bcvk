@@ -49,6 +49,18 @@ and print an error on stderr.
 
     This argument is required.
 
+**--pull**=*PULL*
+
+    When to pull the source image from its registry
+
+    Possible values:
+    - missing
+    - never
+    - always
+    - newer
+
+    Default: missing
+
 **--itype**=*ITYPE*
 
     Instance type (e.g., u1.nano, u1.small, u1.medium). Overrides vcpus/memory if specified.
