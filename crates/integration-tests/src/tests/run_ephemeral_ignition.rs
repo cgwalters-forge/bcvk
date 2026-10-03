@@ -9,10 +9,7 @@ use tempfile::TempDir;
 
 use camino::Utf8Path;
 
-use crate::{get_bck_command, shell, INTEGRATION_TEST_LABEL};
-
-/// Fedora CoreOS image that supports Ignition
-const FCOS_IMAGE: &str = "quay.io/fedora/fedora-coreos:stable";
+use crate::{ensure_image_present, get_bck_command, get_fcos_image, shell, INTEGRATION_TEST_LABEL};
 
 /// Test that Ignition config injection mechanism works
 ///
@@ -27,9 +24,11 @@ fn test_run_ephemeral_ignition_works() -> TestResult {
     let sh = shell()?;
     let bck = get_bck_command()?;
     let label = INTEGRATION_TEST_LABEL;
+    let fcos_image = get_fcos_image();
 
-    // Pull FCOS image first
-    cmd!(sh, "podman pull -q {FCOS_IMAGE}").run()?;
+    // Normally prefetched (with retries) by `just pull-test-images`; only pull
+    // if missing so a registry hiccup here can't fail the test.
+    ensure_image_present(&sh, &fcos_image)?;
 
     // Create a temporary Ignition config
     let temp_dir = TempDir::new()?;
@@ -46,7 +45,7 @@ fn test_run_ephemeral_ignition_works() -> TestResult {
 
     let stdout = cmd!(
         sh,
-        "{bck} ephemeral run --rm --label {label} --ignition {config_path} --execute {script} {FCOS_IMAGE}"
+        "{bck} ephemeral run --rm --label {label} --ignition {config_path} --execute {script} {fcos_image}"
     )
     .read()?;
 
@@ -65,9 +64,11 @@ fn test_run_ephemeral_ignition_invalid_path() -> TestResult {
     let sh = shell()?;
     let bck = get_bck_command()?;
     let label = INTEGRATION_TEST_LABEL;
+    let fcos_image = get_fcos_image();
 
-    // Pull FCOS image first
-    cmd!(sh, "podman pull -q {FCOS_IMAGE}").run()?;
+    // Normally prefetched (with retries) by `just pull-test-images`; only pull
+    // if missing so a registry hiccup here can't fail the test.
+    ensure_image_present(&sh, &fcos_image)?;
 
     let temp = TempDir::new()?;
     let nonexistent_path = Utf8Path::from_path(temp.path())
@@ -76,7 +77,7 @@ fn test_run_ephemeral_ignition_invalid_path() -> TestResult {
 
     let output = cmd!(
         sh,
-        "{bck} ephemeral run --rm --label {label} --ignition {nonexistent_path} --karg systemd.unit=poweroff.target {FCOS_IMAGE}"
+        "{bck} ephemeral run --rm --label {label} --ignition {nonexistent_path} --karg systemd.unit=poweroff.target {fcos_image}"
     )
     .ignore_status()
     .output()?;

@@ -58,6 +58,35 @@ pub(crate) fn get_test_image() -> String {
         .unwrap_or_else(|_| "quay.io/centos-bootc/centos-bootc:stream10".to_string())
 }
 
+/// Get the Fedora CoreOS image used by the Ignition tests
+///
+/// Checks the BCVK_FCOS_IMAGE environment variable (set from the Justfile,
+/// which also prefetches it), then falls back to a hardcoded default.
+pub(crate) fn get_fcos_image() -> String {
+    std::env::var("BCVK_FCOS_IMAGE")
+        .unwrap_or_else(|_| "quay.io/fedora/fedora-coreos:stable".to_string())
+}
+
+/// Pull `image` unless it is already in local storage.
+///
+/// The test images are normally prefetched (with retries) by
+/// `just pull-test-images`, so tests that only need an image to be present
+/// use this rather than going back to the registry, where a transient error
+/// would fail the test. It's `podman pull --policy missing`, which podman 4
+/// (as on the Ubuntu 24.04 CI runners) doesn't have.
+pub(crate) fn ensure_image_present(sh: &Shell, image: &str) -> anyhow::Result<()> {
+    let present = cmd!(sh, "podman image exists {image}")
+        .quiet()
+        .ignore_status()
+        .output()?
+        .status
+        .success();
+    if !present {
+        cmd!(sh, "podman pull -q {image}").run()?;
+    }
+    Ok(())
+}
+
 /// Get all test images for matrix testing
 ///
 /// Parses BCVK_ALL_IMAGES environment variable, which should be a whitespace-separated

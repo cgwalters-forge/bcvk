@@ -23,7 +23,7 @@ use xshell::{cmd, Shell};
 
 use tempfile::TempDir;
 
-use crate::{get_bck_command, get_test_image, shell, INTEGRATION_TEST_LABEL};
+use crate::{ensure_image_present, get_bck_command, get_test_image, shell, INTEGRATION_TEST_LABEL};
 
 /// Validate that a disk image was created successfully with proper bootc installation
 ///
@@ -186,9 +186,10 @@ fn test_to_disk_different_imgref_same_digest() -> TestResult {
     let label = INTEGRATION_TEST_LABEL;
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
 
-    // First, pull the test image
+    // Normally prefetched by `just pull-test-images`; the test only needs it
+    // present locally to tag it, not freshly pulled.
     let test_image = get_test_image();
-    cmd!(sh, "podman pull {test_image}").run()?;
+    ensure_image_present(&sh, &test_image)?;
 
     // Create a second tag pointing to the same digest
     let second_tag = format!("{}-alias", test_image);

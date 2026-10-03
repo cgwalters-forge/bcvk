@@ -18,7 +18,7 @@ use cap_std_ext::cmdext::{CapStdExtCommandExt, CmdFds, SystemdFdName};
 use itest::TestResult;
 use serde::Deserialize;
 
-use crate::{get_bck_command, get_test_image, integration_test, shell};
+use crate::{ensure_image_present, get_bck_command, get_test_image, integration_test, shell};
 
 // ---------------------------------------------------------------------------
 // Client-side response types (redefined to keep integration tests
@@ -251,7 +251,7 @@ fn test_varlink_images_list_contains_test_image() -> TestResult {
 
     // Ensure the image is pulled
     let sh = shell()?;
-    xshell::cmd!(sh, "podman pull -q {image}").run()?;
+    ensure_image_present(&sh, &image)?;
 
     let mut bcvk = activated_connection()?;
     let reply = bcvk.rt.block_on(async { bcvk.conn.list().await })??;
@@ -573,7 +573,7 @@ fn test_varlink_images_list_crosscheck() -> TestResult {
 
     // Ensure the test image is pulled so we have at least one image to compare
     let sh = shell()?;
-    xshell::cmd!(sh, "podman pull -q {image}").run()?;
+    ensure_image_present(&sh, &image)?;
 
     // Primary path: Rust varlink client
     let mut bcvk = activated_connection()?;
