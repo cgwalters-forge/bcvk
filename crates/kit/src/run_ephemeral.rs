@@ -562,6 +562,61 @@ pub struct RunEphemeralOpts {
     pub host_dns_servers: Option<Vec<String>>,
 }
 
+/// Build kernel command line for direct boot.
+fn kernel_cmdline(opts: &RunEphemeralOpts, cloudinit: bool) -> Vec<String> {
+    // We deliberately omit root=, rootfstype=, and rootflags= from the
+    // cmdline. When root= is absent dracut sets rootok=1 via its UNSET
+    // branch and defers entirely to systemd generators. systemd-fstab-
+    // generator likewise produces nothing without a root= arg. The
+    // virtiofs mount is handled solely by the sysroot.mount unit bcvk
+    // injects into every initramfs via the CPIO append, together with the
+    // initrd-root-fs.target.d/bcvk-sysroot.conf drop-in that wires it in.
+    let mut args = [
+        // This avoids having journald interact with the rootfs
+        // at all, which lessens the I/O traffic for virtiofs
+        "systemd.mask=systemd-journal-flush.service",
+        // bootupd's automatic bootloader update needs a block device
+        // backing /boot or /sysroot, but here the root is virtiofs, so the
+        // unit fails and the system boots "degraded". Updating the
+        // bootloader makes no sense in an ephemeral VM anyway, and images
+        // will ship a bootupd without https://github.com/coreos/bootupd/pull/1072
+        // (which skips this case) for a long time.
+        "systemd.mask=bootloader-update.service",
+        // See https://github.com/bootc-dev/bcvk/issues/22
+        "selinux=0",
+        // Start SSH even when the image does not enable it by default.
+        "systemd.wants=sshd.service",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect::<Vec<_>>();
+
+    if opts.common.console {
+        args.push("console=hvc0".to_string());
+    }
+    if cloudinit {
+        // Fully disable cloud-init in ephemeral VMs. We don't provide any
+        // cloud-init datasource, and using `ds=None` (which tells cloud-init
+        // to use DataSourceNone) causes problems: the cloud-init generator
+        // still creates its activation symlink, which triggers a systemd
+        // drop-in condition (disable-sshd-keygen-if-cloud-init-active.conf)
+        // that prevents sshd-keygen from generating host keys. Since
+        // cloud-init itself never runs in the ephemeral VM (the boot target
+        // doesn't pull in multi-user.target), sshd ends up with no host
+        // keys and fails to start.
+        args.push("cloud-init=disabled".to_string());
+    }
+
+    // Add Ignition platform kernel argument if Ignition config is specified
+    // This tells Ignition which platform it's running on and where to find the config
+    if opts.ignition_config.is_some() {
+        args.push("ignition.platform.id=qemu".to_string());
+    }
+
+    args.extend(opts.kernel_args.iter().cloned());
+    args
+}
+
 /// Parse DNS servers from resolv.conf format content
 fn parse_resolv_conf(content: &str) -> Vec<String> {
     let mut dns_servers = Vec::new();
@@ -1769,57 +1824,7 @@ StandardOutput=file:/dev/virtio-ports/executestatus
         qemu_config.add_systemd_credential_file("tmpfiles.extra", credential_path.to_owned());
     }
 
-    // Build kernel command line for direct boot.
-    //
-    // We deliberately omit root=, rootfstype=, and rootflags= from the
-    // cmdline.  When root= is absent dracut sets rootok=1 via its UNSET
-    // branch and defers entirely to systemd generators.  systemd-fstab-
-    // generator likewise produces nothing without a root= arg.  The
-    // virtiofs mount is handled solely by the sysroot.mount unit bcvk
-    // injects into every initramfs via the CPIO append, together with the
-    // initrd-root-fs.target.d/bcvk-sysroot.conf drop-in that wires it in.
-    let mut kernel_cmdline = [
-        // This avoids having journald interact with the rootfs
-        // at all, which lessens the I/O traffic for virtiofs
-        "systemd.mask=systemd-journal-flush.service",
-        // bootupd's automatic bootloader update needs a block device
-        // backing /boot or /sysroot, but here the root is virtiofs, so the
-        // unit fails and the system boots "degraded". Updating the
-        // bootloader makes no sense in an ephemeral VM anyway, and images
-        // will ship a bootupd without https://github.com/coreos/bootupd/pull/1072
-        // (which skips this case) for a long time.
-        "systemd.mask=bootloader-update.service",
-        // See https://github.com/bootc-dev/bcvk/issues/22
-        "selinux=0",
-    ]
-    .into_iter()
-    .map(ToOwned::to_owned)
-    .collect::<Vec<_>>();
-
-    if opts.common.console {
-        kernel_cmdline.push("console=hvc0".to_string());
-    }
-    if cloudinit {
-        // Fully disable cloud-init in ephemeral VMs. We don't provide any
-        // cloud-init datasource, and using `ds=None` (which tells cloud-init
-        // to use DataSourceNone) causes problems: the cloud-init generator
-        // still creates its activation symlink, which triggers a systemd
-        // drop-in condition (disable-sshd-keygen-if-cloud-init-active.conf)
-        // that prevents sshd-keygen from generating host keys. Since
-        // cloud-init itself never runs in the ephemeral VM (the boot target
-        // doesn't pull in multi-user.target), sshd ends up with no host
-        // keys and fails to start.
-        kernel_cmdline.push("cloud-init=disabled".to_string());
-    }
-
-    // Add Ignition platform kernel argument if Ignition config is specified
-    // This tells Ignition which platform it's running on and where to find the config
-    if opts.ignition_config.is_some() {
-        kernel_cmdline.push("ignition.platform.id=qemu".to_string());
-    }
-
-    kernel_cmdline.extend(opts.kernel_args.clone());
-    qemu_config.set_kernel_cmdline(kernel_cmdline);
+    qemu_config.set_kernel_cmdline(kernel_cmdline(&opts, cloudinit));
 
     // Add Ignition config if specified
     // Different architectures require different methods (per FCOS docs):
@@ -2247,6 +2252,71 @@ Options=
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kernel_cmdline() {
+        let defaults = [
+            "systemd.mask=systemd-journal-flush.service",
+            "systemd.mask=bootloader-update.service",
+            "selinux=0",
+            "systemd.wants=sshd.service",
+        ];
+        for (name, cli, cloudinit, extra) in [
+            ("defaults", vec![], false, vec![]),
+            ("keygen", vec!["-K"], false, vec![]),
+            (
+                "installer",
+                vec!["--karg=systemd.unit=bcvk-to-disk.target"],
+                false,
+                vec!["systemd.unit=bcvk-to-disk.target"],
+            ),
+            ("console", vec!["--console"], false, vec!["console=hvc0"]),
+            ("cloudinit", vec![], true, vec!["cloud-init=disabled"]),
+            (
+                "ignition",
+                vec!["--ignition=config.json"],
+                false,
+                vec!["ignition.platform.id=qemu"],
+            ),
+            (
+                "user wants/mask",
+                vec![
+                    "--karg=systemd.wants=sshd.service",
+                    "--karg=systemd.mask=sshd.service",
+                ],
+                false,
+                vec!["systemd.wants=sshd.service", "systemd.mask=sshd.service"],
+            ),
+            (
+                "combined overrides",
+                vec![
+                    "-K",
+                    "--console",
+                    "--ignition=config.json",
+                    "--karg=console=ttyS0",
+                    "--karg=cloud-init=enabled",
+                    "--karg=ignition.platform.id=metal",
+                    "--karg=systemd.mask=sshd.service",
+                ],
+                true,
+                vec![
+                    "console=hvc0",
+                    "cloud-init=disabled",
+                    "ignition.platform.id=qemu",
+                    "console=ttyS0",
+                    "cloud-init=enabled",
+                    "ignition.platform.id=metal",
+                    "systemd.mask=sshd.service",
+                ],
+            ),
+        ] {
+            let opts =
+                RunEphemeralOpts::try_parse_from(["bcvk", "test-image"].into_iter().chain(cli))
+                    .unwrap();
+            let expected: Vec<_> = defaults.into_iter().chain(extra).collect();
+            assert_eq!(kernel_cmdline(&opts, cloudinit), expected, "{name}");
+        }
+    }
 
     #[test]
     fn test_is_zstd_efi_zboot() -> Result<()> {
