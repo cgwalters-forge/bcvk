@@ -246,6 +246,7 @@ impl BcvkService {
 
             let run_opts = RunEphemeralOpts {
                 image,
+                pull: crate::podman::PullPolicy::default(),
                 common: CommonVmOpts {
                     itype,
                     memory: crate::common_opts::MemoryOpts {

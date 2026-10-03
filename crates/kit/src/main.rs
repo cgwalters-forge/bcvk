@@ -80,6 +80,49 @@ struct Cli {
     command: Commands,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod pull_tests {
+    use super::*;
+    use crate::podman::PullPolicy;
+
+    #[test]
+    fn test_pull_cli_parsing() {
+        for path in ["ephemeral", "libvirt"] {
+            for (flag, expected) in [
+                (None, PullPolicy::Missing),
+                (Some("--pull=missing"), PullPolicy::Missing),
+                (Some("--pull=never"), PullPolicy::Never),
+                (Some("--pull=always"), PullPolicy::Always),
+                (Some("--pull=newer"), PullPolicy::Newer),
+            ] {
+                let mut args = vec!["bcvk", path, "run"];
+                args.extend(flag);
+                args.push("quay.io/example/os:latest");
+                let cli = Cli::try_parse_from(args).unwrap();
+                let actual = match cli.command {
+                    Commands::Ephemeral(ephemeral::EphemeralCommands::Run(opts)) => opts.pull,
+                    Commands::Libvirt {
+                        command: libvirt::LibvirtSubcommands::Run(opts),
+                        ..
+                    } => opts.pull,
+                    _ => panic!("Expected {path} run"),
+                };
+                assert_eq!(actual, expected, "{path}, {flag:?}");
+            }
+            for flag in ["--pull=invalid", "--pull=", "--pull=Newer"] {
+                let err = Cli::try_parse_from(["bcvk", path, "run", flag, "example:latest"])
+                    .err()
+                    .expect("Invalid policy must fail parsing");
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::InvalidValue,
+                    "{path}, {flag}"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Parser)]
 struct DebugInternalsOpts {

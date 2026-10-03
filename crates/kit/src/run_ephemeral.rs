@@ -499,6 +499,11 @@ pub struct RunEphemeralOpts {
     #[clap(help = "Container image to run as ephemeral VM")]
     pub image: String,
 
+    /// When to pull the source image from its registry.
+    #[clap(long, value_enum, default_value = "missing")]
+    #[serde(default)]
+    pub pull: podman::PullPolicy,
+
     #[clap(flatten)]
     pub common: CommonVmOpts,
 
@@ -691,6 +696,8 @@ fn prepare_run_command_with_temp(
 )> {
     debug!("Running QEMU inside hybrid container for {}", opts.image);
 
+    podman::prepare_image(&opts.image, opts.pull)?;
+
     // Check Ignition support early (before launching container) if --ignition is specified
     if opts.ignition_config.is_some() {
         let has_ignition = check_ignition_support(&opts.image)?;
@@ -776,8 +783,7 @@ fn prepare_run_command_with_temp(
     // Run the container with the setup script
     let mut cmd = Command::new("podman");
     cmd.arg("run");
-    // We don't do pulling because then we'd have to propagate all the authfile
-    // and status output for that in the general case.
+    // The source image has already been prepared according to the user's policy.
     cmd.arg("--pull=never");
     // We always have a label
     cmd.arg("--label=bcvk.ephemeral=1");

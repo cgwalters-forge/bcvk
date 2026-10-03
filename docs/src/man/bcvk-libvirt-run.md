@@ -19,6 +19,18 @@ Run a bootable container as a persistent VM
 
     This argument is required.
 
+**--pull**=*PULL*
+
+    When to pull the source image from its registry
+
+    Possible values:
+    - missing
+    - never
+    - always
+    - newer
+
+    Default: missing
+
 **--name**=*NAME*
 
     Name for the VM (auto-generated if not specified)
@@ -161,6 +173,10 @@ Run a bootable container as a persistent VM
 **--ignition**=*IGNITION_CONFIG*
 
     Path to Ignition config file (JSON format) for first-boot provisioning
+
+**--virtiofsd**=*VIRTIOFSD_BINARY*
+
+    Path to virtiofsd binary (overrides auto-detection for disk creation)
 
 **--console-log**=*CONSOLE_LOG*
 

@@ -50,6 +50,18 @@ This design allows bcvk to provide VM-like isolation and boot behavior while lev
 
     This argument is required.
 
+**--pull**=*PULL*
+
+    When to pull the source image from its registry
+
+    Possible values:
+    - missing
+    - never
+    - always
+    - newer
+
+    Default: missing
+
 **--itype**=*ITYPE*
 
     Instance type (e.g., u1.nano, u1.small, u1.medium). Overrides vcpus/memory if specified.
@@ -67,7 +79,6 @@ This design allows bcvk to provide VM-like isolation and boot behavior while lev
 **--console**
 
     Connect the QEMU console to the container's stdio (visible via podman logs/attach)
-    Add **-i -t** to send keyboard input to the guest console.
 
 **--debug**
 
