@@ -4,6 +4,7 @@
 
 - [Installation](./installation.md)
 - [Quick Start](./quick-start.md)
+- [Testing Your Image](./testing-images.md)
 - [Workflow Comparison](./workflow-comparison.md)
 - [Varlink IPC](./varlink.md)
 
