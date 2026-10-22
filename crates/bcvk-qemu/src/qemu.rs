@@ -537,6 +537,9 @@ fn spawn(
         .context("Checking for qemu")?;
 
     let mut cmd = Command::new(qemu);
+    if let Some(data_dir) = std::env::var_os("QEMU_DATA_DIR") {
+        cmd.arg("-L").arg(data_dir);
+    }
     // SAFETY: This API is safe to call in a forked child.
     #[allow(unsafe_code)]
     unsafe {
@@ -653,28 +656,10 @@ fn spawn(
     // Add virtio-serial controller - always needed for console
     cmd.args(["-device", "virtio-serial"]);
 
-    // Add virtio-serial devices
+    // Add virtio-serial devices.
     for (idx, serial_device) in config.virtio_serial_devices.iter().enumerate() {
-        let char_id = format!("serial_char{}", idx);
-        // Build chardev args with optional append
-        let chardev_args = if serial_device.append {
-            format!(
-                "file,id={},path={},append=on",
-                char_id, serial_device.output_file
-            )
-        } else {
-            format!("file,id={},path={}", char_id, serial_device.output_file)
-        };
-
-        cmd.args([
-            "-chardev",
-            &chardev_args,
-            "-device",
-            &format!(
-                "virtserialport,chardev={},name={}",
-                char_id, serial_device.name
-            ),
-        ]);
+        let args = virtio_serial_args(idx, serial_device);
+        cmd.args(["-chardev", &args.0, "-device", &args.1]);
     }
 
     // Configure network (only User mode supported now)
@@ -779,6 +764,24 @@ fn spawn(
     tracing::debug!("{cmd:?}");
 
     cmd.spawn().context("Failed to spawn QEMU")
+}
+
+/// Build QEMU's chardev and virtserialport arguments for one serial output.
+fn virtio_serial_args(index: usize, serial_device: &VirtioSerialOut) -> (String, String) {
+    let char_id = format!("serial_char{index}");
+    let chardev = if serial_device.append {
+        format!(
+            "file,id={char_id},path={},append=on",
+            serial_device.output_file
+        )
+    } else {
+        format!("file,id={char_id},path={}", serial_device.output_file)
+    };
+    let device = format!(
+        "virtserialport,chardev={char_id},name={}",
+        serial_device.name
+    );
+    (chardev, device)
 }
 
 struct VsockCopier {
@@ -1012,6 +1015,22 @@ mod tests {
         assert_eq!(
             config.virtio_serial_devices[0].output_file,
             "/tmp/output.txt"
+        );
+    }
+
+    #[test]
+    fn test_virtio_serial_args() {
+        let device = VirtioSerialOut {
+            name: "org.bootc.debug".to_owned(),
+            output_file: "/dev/fdset/1".to_owned(),
+            append: true,
+        };
+        assert_eq!(
+            virtio_serial_args(2, &device),
+            (
+                "file,id=serial_char2,path=/dev/fdset/1,append=on".to_owned(),
+                "virtserialport,chardev=serial_char2,name=org.bootc.debug".to_owned(),
+            )
         );
     }
 

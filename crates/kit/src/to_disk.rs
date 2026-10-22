@@ -139,6 +139,13 @@ pub struct ToDiskAdditionalOpts {
     )]
     pub label: Vec<String>,
 
+    #[clap(
+        long = "ro-bind",
+        value_name = "HOST_PATH[:NAME]",
+        help = "Bind mount a host path read-only at /run/virtiofs-mnt-<name> in the installer VM"
+    )]
+    pub ro_bind_mounts: Vec<String>,
+
     /// Check if the disk would be regenerated without actually creating it
     #[clap(long)]
     pub dry_run: bool,
@@ -548,10 +555,10 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         // Basically containers-libs allocates a tempfile for a whole serialization of a layer as a tarball
         // when fetching, so we need enough memory to do so.
         add_swap: Some(format!("{disk_size}")),
-        bind_mounts: Vec::new(),    // No additional bind mounts needed
-        ro_bind_mounts: Vec::new(), // No additional ro bind mounts needed
-        systemd_units_dir: None,    // No custom systemd units
-        bind_storage_ro: true,      // Mount host container storage read-only
+        bind_mounts: Vec::new(), // No additional bind mounts needed
+        ro_bind_mounts: opts.additional.ro_bind_mounts.clone(),
+        systemd_units_dir: None, // No custom systemd units
+        bind_storage_ro: true,   // Mount host container storage read-only
         mount_disk_files: vec![format!(
             "{}:output:{}",
             opts.target_disk,
@@ -729,6 +736,29 @@ mod tests {
         assert_eq!(
             opts.additional.bootc_install_podman_args,
             ["--read-only", "--env=FOO=bar"]
+        );
+    }
+
+    #[test]
+    fn test_ro_bind_is_retained_for_installer_vm() {
+        use clap::Parser;
+
+        let opts = ToDiskOpts::try_parse_from([
+            "bcvk",
+            "test:latest",
+            "/tmp/test.img",
+            "--ro-bind",
+            "/home/user/qemu/build:qemu-bin",
+            "--ro-bind",
+            "/home/user/qemu/pc-bios:qemu-data",
+        ])
+        .unwrap();
+        assert_eq!(
+            opts.additional.ro_bind_mounts,
+            [
+                "/home/user/qemu/build:qemu-bin",
+                "/home/user/qemu/pc-bios:qemu-data"
+            ]
         );
     }
 }

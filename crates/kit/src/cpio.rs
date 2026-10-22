@@ -78,6 +78,13 @@ pub fn create_initramfs_units_cpio() -> io::Result<Vec<u8>> {
             "usr/lib/systemd/system/bcvk-journal-stream.service",
             include_bytes!("units/bcvk-journal-stream.service"),
         ),
+        // The initrd journal streamer must be embedded because systemd <256
+        // cannot consume the systemd.extra-unit credential in the initrd.
+        // bcvk-copy-units.service copies it into /run before switch-root.
+        File(
+            "usr/lib/systemd/system/bcvk-journal-stream-initrd.service",
+            include_bytes!("units/bcvk-journal-stream-initrd.service"),
+        ),
         // Drop-in to pull sysroot.mount into initrd-root-fs.target.  Without
         // this, nothing in the dependency graph actually requests the mount;
         // dracut-rootfs-generator normally creates an
@@ -195,6 +202,7 @@ mod tests {
         assert!(names.contains(&"usr/lib/systemd/system/bcvk-var-ephemeral.service"));
         assert!(names.contains(&"usr/lib/systemd/system/bcvk-copy-units.service"));
         assert!(names.contains(&"usr/lib/systemd/system/bcvk-journal-stream.service"));
+        assert!(names.contains(&"usr/lib/systemd/system/bcvk-journal-stream-initrd.service"));
 
         // initrd-root-fs.target drop-in
         assert!(names.contains(&"usr/lib/systemd/system/initrd-root-fs.target.d/bcvk-sysroot.conf"));

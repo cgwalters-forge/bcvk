@@ -112,6 +112,247 @@ pub fn default_vcpus() -> u32 {
         .unwrap_or(2)
 }
 
+const VIRTIO_SERIAL_FDS_ENV: &str = "BCVK_VIRTIO_SERIAL_FDS";
+const QEMU_CONTAINER_PATH: &str = "/run/bcvk-qemu/qemu-system";
+const QEMU_DATA_CONTAINER_PATH: &str = "/run/bcvk-qemu/data";
+
+#[derive(Debug, PartialEq, Eq)]
+struct VirtioSerialOutput {
+    name: String,
+    path: std::path::PathBuf,
+}
+
+/// Parse the user-facing `NAME:FILE` form without opening the output files.
+fn parse_virtio_serial_outputs(specs: &[String]) -> Result<Vec<VirtioSerialOutput>> {
+    let mut outputs = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (name, path) = spec
+            .split_once(':')
+            .ok_or_else(|| eyre!("Invalid --virtio-serial-out {spec:?}: expected NAME:FILE"))?;
+        validate_virtio_serial_name(name)?;
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(eyre!(
+                "Invalid --virtio-serial-out output path {path:?}: an absolute path is required"
+            ));
+        }
+        if outputs
+            .iter()
+            .any(|output: &VirtioSerialOutput| output.name == name)
+        {
+            return Err(eyre!("Duplicate --virtio-serial-out name {name:?}"));
+        }
+        outputs.push(VirtioSerialOutput {
+            name: name.to_owned(),
+            path,
+        });
+    }
+    Ok(outputs)
+}
+
+fn validate_virtio_serial_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(eyre!(
+            "Invalid --virtio-serial-out name {name:?}: use ASCII letters, digits, '.', '_' or '-'"
+        ));
+    }
+    Ok(())
+}
+
+/// Open serial outputs on the host and arrange for podman to preserve their fds.
+fn forward_virtio_serial_outputs(
+    outputs: &[VirtioSerialOutput],
+    cmd: &mut Command,
+    fds: &mut cap_std_ext::cmdext::CmdFds,
+) -> Result<()> {
+    let mut forwarded = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32;
+        let mut options = std::fs::OpenOptions::new();
+        let file = options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            // Do not follow an output symlink or block on a FIFO before we can
+            // reject it below.  The descriptor is subsequently checked to be a
+            // regular file.
+            .custom_flags(flags)
+            .open(&output.path)
+            .with_context(|| {
+                format!(
+                    "Opening --virtio-serial-out output for {} at {:?}",
+                    output.name, output.path
+                )
+            })?;
+        if !file
+            .metadata()
+            .with_context(|| {
+                format!(
+                    "Checking --virtio-serial-out output for {} at {:?}",
+                    output.name, output.path
+                )
+            })?
+            .is_file()
+        {
+            return Err(eyre!(
+                "--virtio-serial-out output for {} is not a regular file: {:?}",
+                output.name,
+                output.path
+            ));
+        }
+        let fd = fds.take_fd(std::sync::Arc::new(file.into()));
+        cmd.args(["--preserve-fd", &fd.to_string()]);
+        forwarded.push(format!("{}:{fd}", output.name));
+    }
+    if !forwarded.is_empty() {
+        cmd.args([
+            "-e",
+            &format!("{VIRTIO_SERIAL_FDS_ENV}={}", forwarded.join(",")),
+        ]);
+    }
+    Ok(())
+}
+
+/// Parse the `NAME:FD` form used only after podman has preserved host fds.
+fn parse_forwarded_virtio_serial_outputs(specs: &str) -> Result<Vec<(String, i32)>> {
+    if specs.is_empty() {
+        return Err(eyre!("{VIRTIO_SERIAL_FDS_ENV} is empty"));
+    }
+    let outputs = specs
+        .split(',')
+        .map(|spec| {
+            let (name, fd) = spec.split_once(':').ok_or_else(|| {
+                eyre!("Invalid {VIRTIO_SERIAL_FDS_ENV} entry {spec:?}: expected NAME:FD")
+            })?;
+            validate_virtio_serial_name(name)?;
+            let fd = fd
+                .parse::<i32>()
+                .with_context(|| format!("Invalid {VIRTIO_SERIAL_FDS_ENV} fd for {name:?}"))?;
+            if fd < 3 {
+                return Err(eyre!(
+                    "Invalid {VIRTIO_SERIAL_FDS_ENV} fd for {name:?}: {fd}; expected an fd of at least 3"
+                ));
+            }
+            Ok((name.to_owned(), fd))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if outputs
+        .iter()
+        .enumerate()
+        .any(|(index, output)| outputs[..index].iter().any(|prior| prior.0 == output.0))
+    {
+        return Err(eyre!("Duplicate {VIRTIO_SERIAL_FDS_ENV} name"));
+    }
+    Ok(outputs)
+}
+
+/// Create the podman command, forwarding preserved fds through a toolbox host bridge.
+fn podman_command(forwarded_fd_count: usize, in_toolbox: bool) -> Command {
+    if in_toolbox {
+        let mut command = Command::new("flatpak-spawn");
+        command.arg("--host");
+        for fd in 3..3 + forwarded_fd_count {
+            command.arg(format!("--forward-fd={fd}"));
+        }
+        command.arg("/usr/bin/podman");
+        command
+    } else {
+        Command::new("podman")
+    }
+}
+
+/// Resolve and validate a host QEMU override before crossing the container boundary.
+fn resolve_qemu_override(path: &str) -> Result<Utf8PathBuf> {
+    let path = std::path::Path::new(path)
+        .canonicalize()
+        .with_context(|| format!("Resolving BCVK_QEMU path {path:?}"))?;
+    let metadata =
+        std::fs::metadata(&path).with_context(|| format!("Inspecting BCVK_QEMU path {path:?}"))?;
+    if !metadata.is_file() {
+        return Err(eyre!("BCVK_QEMU is not a regular file: {path:?}"));
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(eyre!("BCVK_QEMU is not executable: {path:?}"));
+    }
+    let path = Utf8PathBuf::from_path_buf(path)
+        .map_err(|path| eyre!("BCVK_QEMU path is not valid UTF-8: {path:?}"))?;
+    if path.as_str().contains(':') {
+        return Err(eyre!(
+            "BCVK_QEMU path contains ':', which cannot be represented in a podman volume: {path:?}"
+        ));
+    }
+    Ok(path)
+}
+
+/// Resolve a QEMU data directory that will be passed as QEMU's `-L` path.
+fn resolve_qemu_data_dir(path: &str) -> Result<Utf8PathBuf> {
+    let path = std::path::Path::new(path)
+        .canonicalize()
+        .with_context(|| format!("Resolving BCVK_QEMU_DATA path {path:?}"))?;
+    if !path.is_dir() {
+        return Err(eyre!("BCVK_QEMU_DATA is not a directory: {path:?}"));
+    }
+    let path = Utf8PathBuf::from_path_buf(path)
+        .map_err(|path| eyre!("BCVK_QEMU_DATA path is not valid UTF-8: {path:?}"))?;
+    if path.as_str().contains(':') {
+        return Err(eyre!(
+            "BCVK_QEMU_DATA path contains ':', which cannot be represented in a podman volume: {path:?}"
+        ));
+    }
+    Ok(path)
+}
+
+/// Select an explicit override, or the process-wide fallback used by internal callers.
+///
+/// Clap applies `BCVK_QEMU` only while parsing a command line.  Some callers construct
+/// `CommonVmOpts` directly (notably libvirt base-disk creation), so apply the same
+/// fallback here at the host/container boundary.
+fn select_qemu_override(
+    explicit: Option<String>,
+    environment: Option<std::ffi::OsString>,
+) -> Result<Option<String>> {
+    match explicit {
+        Some(path) => Ok(Some(path)),
+        None => environment
+            .map(|path| {
+                path.into_string()
+                    .map_err(|path| eyre!("BCVK_QEMU path is not valid UTF-8: {path:?}"))
+            })
+            .transpose(),
+    }
+}
+
+/// Bind a validated host QEMU into the container and select it for the inner process.
+fn add_qemu_override(command: &mut Command, qemu: &Utf8Path, data_dir: Option<&Utf8Path>) {
+    command.args([
+        "-v",
+        &format!("{qemu}:{QEMU_CONTAINER_PATH}:ro"),
+        "-e",
+        &format!("QEMU_BIN={QEMU_CONTAINER_PATH}"),
+    ]);
+    if let Some(data_dir) = data_dir {
+        command.args([
+            "-v",
+            &format!("{data_dir}:{QEMU_DATA_CONTAINER_PATH}:ro"),
+            "-e",
+            &format!("QEMU_DATA_DIR={QEMU_DATA_CONTAINER_PATH}"),
+        ]);
+    }
+}
+
+/// Return the conflicting podman environment spec, if it overrides inner QEMU selection.
+fn qemu_override_env_conflict(env: &[String]) -> Option<&str> {
+    env.iter()
+        .map(String::as_str)
+        .find(|spec| *spec == "QEMU_BIN" || spec.starts_with("QEMU_BIN="))
+}
+
 use crate::qemu::{self, QemuConfigExt};
 use crate::{
     boot_progress,
@@ -419,7 +660,7 @@ pub struct CommonVmOpts {
     #[clap(
         long = "virtio-serial-out",
         value_name = "NAME:FILE",
-        help = "Add virtio-serial device with output to file (format: name:/path/to/file)"
+        help = "Add a guest /dev/virtio-ports/NAME captured to FILE (an absolute regular file, created or truncated)"
     )]
     pub virtio_serial_out: Vec<String>,
 
@@ -442,6 +683,14 @@ pub struct CommonVmOpts {
         help = "Path to virtiofsd binary (overrides auto-detection)"
     )]
     pub virtiofsd_binary: Option<String>,
+
+    #[clap(
+        long = "qemu",
+        env = "BCVK_QEMU",
+        value_name = "PATH",
+        long_help = "Host QEMU executable to bind into the VM container.\n\nThis bind-mounts only the executable; its shared libraries and firmware must be available in the container's host /usr mount. Use a wrapper or QEMU's own options to select separate data directories. Cannot be combined with --env QEMU_BIN[=VALUE]."
+    )]
+    pub qemu_binary: Option<String>,
 
     /// Select how VM output is presented.
     ///
@@ -670,7 +919,7 @@ pub fn run(opts: RunEphemeralOpts) -> Result<()> {
 /// `--log-dir=journal=…` was requested).  The caller must keep them alive until
 /// podman exits so the fds are not closed prematurely.
 fn prepare_run_command(
-    opts: RunEphemeralOpts,
+    mut opts: RunEphemeralOpts,
 ) -> Result<(
     std::process::Command,
     Vec<std::sync::Arc<rustix::fd::OwnedFd>>,
@@ -690,6 +939,35 @@ fn prepare_run_command(
 
     let self_exe = std::env::current_exe()?;
     let self_exe = self_exe.as_str()?;
+    opts.common.qemu_binary = select_qemu_override(
+        opts.common.qemu_binary.take(),
+        std::env::var_os("BCVK_QEMU"),
+    )?;
+    if opts.common.qemu_binary.is_some() {
+        if let Some(conflict) = qemu_override_env_conflict(&opts.podman.env) {
+            return Err(eyre!(
+                "BCVK_QEMU/--qemu cannot be combined with --env {conflict:?}; remove the QEMU_BIN environment override"
+            ));
+        }
+    }
+    let qemu_override = opts
+        .common
+        .qemu_binary
+        .as_deref()
+        .map(resolve_qemu_override)
+        .transpose()?;
+    let qemu_data_dir = std::env::var_os("BCVK_QEMU_DATA")
+        .map(|path| {
+            path.into_string()
+                .map_err(|path| eyre!("BCVK_QEMU_DATA path is not valid UTF-8: {path:?}"))
+        })
+        .transpose()?
+        .as_deref()
+        .map(resolve_qemu_data_dir)
+        .transpose()?;
+    if qemu_data_dir.is_some() && qemu_override.is_none() {
+        return Err(eyre!("BCVK_QEMU_DATA requires BCVK_QEMU or --qemu"));
+    }
 
     // Process disk files and create them if needed
     let processed_disk_files = process_disk_files(&opts.mount_disk_files, &opts.image)?;
@@ -743,12 +1021,22 @@ fn prepare_run_command(
         host_mounts.push((host_path, mount_name, true)); // true = read-only
     }
 
-    // Run the container with the setup script
-    let mut cmd = Command::new("podman");
+    let serial_outputs = parse_virtio_serial_outputs(&opts.common.virtio_serial_out)?;
+    let journal_fd_count = usize::from(opts.common.log_dir.as_ref().is_some_and(|d| d.journal)) * 2;
+
+    // Run the container with the setup script.  toolbox's podman wrapper does
+    // not itself forward fds, so invoke flatpak-spawn directly when necessary.
+    let mut cmd = podman_command(
+        journal_fd_count + serial_outputs.len(),
+        std::env::var_os("TOOLBOX_PATH").is_some(),
+    );
     cmd.arg("run");
     // We don't do pulling because then we'd have to propagate all the authfile
     // and status output for that in the general case.
     cmd.arg("--pull=never");
+    if let Some(qemu_override) = qemu_override.as_deref() {
+        add_qemu_override(&mut cmd, qemu_override, qemu_data_dir.as_deref());
+    }
     // We always have a label
     cmd.arg("--label=bcvk.ephemeral=1");
     for label in opts.podman.label.iter() {
@@ -912,9 +1200,9 @@ fn prepare_run_command(
     // O_CLOEXEC clearing in a pre_exec hook; flatpak-spawn --forward-fd (in our
     // podman wrapper) ensures the fds also reach the real host podman from inside
     // a toolbox.
+    let mut fds = cap_std_ext::cmdext::CmdFds::new();
     let mut journal_fds: Vec<std::sync::Arc<rustix::fd::OwnedFd>> = Vec::new();
     if opts.common.log_dir.as_ref().map_or(false, |d| d.journal) {
-        let mut fds = cap_std_ext::cmdext::CmdFds::new();
         let mut fd_nums = Vec::new();
         for dest in [
             opts.common.log_dir.as_ref().and_then(|d| d.journal_path()),
@@ -942,9 +1230,11 @@ fn prepare_run_command(
             fd_nums.push(fd_n.to_string());
             journal_fds.push(owned);
         }
-        cmd.take_fds(fds);
         cmd.args(["-e", &format!("BCVK_JOURNAL_FDS={}", fd_nums.join(","))]);
     }
+
+    forward_virtio_serial_outputs(&serial_outputs, &mut cmd, &mut fds)?;
+    cmd.take_fds(fds);
 
     // If a console log path was requested via --log-dir, bind-mount its parent
     // directory into the container and tell run_impl the in-container path via
@@ -971,15 +1261,6 @@ fn prepare_run_command(
         let in_container_path = format!("{}/{}", container_log_dir, file_name.to_string_lossy());
         cmd.args(["-e", &format!("BCVK_CONSOLE_PATH={in_container_path}")]);
         debug!("Bind-mounting console log dir {abs_parent:?} → {container_log_dir}");
-    }
-
-    // Handle --execute output files and virtio-serial devices
-    let mut all_serial_devices = opts.common.virtio_serial_out.clone();
-    if !opts.common.execute.is_empty() {
-        // Add virtio-serial devices for execute output and status
-        // These will be created inside the container at /run/execute-output/
-        all_serial_devices.push("execute:/run/execute-output/execute-output.txt".to_string());
-        all_serial_devices.push("executestatus:/run/execute-output/execute-status.txt".to_string());
     }
 
     // Pass disk files as environment variable
@@ -1270,6 +1551,15 @@ pub(crate) async fn run_impl(opts: RunEphemeralOpts) -> Result<()> {
     use std::fs;
 
     debug!("Running QEMU implementation inside container");
+
+    if opts.common.qemu_binary.is_some()
+        && std::env::var_os("QEMU_BIN").as_deref()
+            != Some(std::ffi::OsStr::new(QEMU_CONTAINER_PATH))
+    {
+        return Err(eyre!(
+            "BCVK_QEMU was requested but its host executable was not mounted into the container"
+        ));
+    }
 
     // Check for required binaries in the target container image early
     check_required_container_binaries()?;
@@ -1832,6 +2122,23 @@ Options=
 
     qemu_config.set_console(opts.common.console);
 
+    // User-requested serial output files are opened by the host, rather than by
+    // QEMU in the container.  This both makes their host location unambiguous
+    // and carries the descriptors through toolbox/bwrap and podman.
+    if !opts.common.virtio_serial_out.is_empty() {
+        let serial_fds = std::env::var(VIRTIO_SERIAL_FDS_ENV)
+            .context("--virtio-serial-out descriptors were not forwarded to the container")?;
+        for (name, fd) in parse_forwarded_virtio_serial_outputs(&serial_fds)? {
+            // SAFETY: the host opened this descriptor and preserved it through
+            // execve / flatpak-spawn --forward-fd / podman --preserve-fd.  This
+            // process assumes ownership after the container entrypoint exec.
+            #[allow(unsafe_code)]
+            let fd = unsafe { rustix::fd::OwnedFd::from_raw_fd(fd) };
+            let fdset = qemu_config.add_fd(std::sync::Arc::new(fd));
+            qemu_config.add_virtio_serial_out(&name, fdset, true);
+        }
+    }
+
     // Set serial console log path if provided via --log-dir=console=...
     // The host bound-mounted the parent directory; BCVK_CONSOLE_PATH is the
     // in-container path that QEMU can write to directly.
@@ -2113,6 +2420,174 @@ Options=
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_virtio_serial_outputs() {
+        let outputs = parse_virtio_serial_outputs(&[
+            "org.bootc.debug:/tmp/debug.log".to_owned(),
+            "another-port:/var/tmp/another.log".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                VirtioSerialOutput {
+                    name: "org.bootc.debug".to_owned(),
+                    path: "/tmp/debug.log".into(),
+                },
+                VirtioSerialOutput {
+                    name: "another-port".to_owned(),
+                    path: "/var/tmp/another.log".into(),
+                },
+            ]
+        );
+
+        for invalid in [
+            "missing-separator",
+            ":/tmp/output",
+            "bad,name:/tmp/output",
+            "name:relative",
+        ] {
+            assert!(
+                parse_virtio_serial_outputs(&[invalid.to_owned()]).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(parse_virtio_serial_outputs(&[
+            "duplicate:/tmp/one".to_owned(),
+            "duplicate:/tmp/two".to_owned(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn test_parse_forwarded_virtio_serial_outputs() {
+        assert_eq!(
+            parse_forwarded_virtio_serial_outputs("org.bootc.debug:100,other:101").unwrap(),
+            vec![
+                ("org.bootc.debug".to_owned(), 100),
+                ("other".to_owned(), 101),
+            ]
+        );
+        for invalid in ["", "missing-fd", "name:not-a-number", "name:-1", "name:0"] {
+            assert!(
+                parse_forwarded_virtio_serial_outputs(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_virtio_serial_outputs_adds_podman_args() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("debug.log");
+        std::fs::write(&path, "previous output").unwrap();
+        let output = VirtioSerialOutput {
+            name: "org.bootc.debug".to_owned(),
+            path: path.clone(),
+        };
+        let mut command = Command::new("podman");
+        let mut fds = cap_std_ext::cmdext::CmdFds::new();
+        forward_virtio_serial_outputs(&[output], &mut command, &mut fds).unwrap();
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "--preserve-fd",
+                "3",
+                "-e",
+                "BCVK_VIRTIO_SERIAL_FDS=org.bootc.debug:3",
+            ]
+        );
+        assert!(path.is_file());
+        assert_eq!(std::fs::read(path).unwrap(), b"");
+    }
+
+    #[test]
+    fn test_qemu_override_resolution_and_command() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("qemu with spaces");
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved = resolve_qemu_override(executable.to_str().unwrap()).unwrap();
+        let mut command = Command::new("podman");
+        add_qemu_override(&mut command, &resolved, None);
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "-v".to_owned(),
+                format!("{}:{QEMU_CONTAINER_PATH}:ro", executable.display()),
+                "-e".to_owned(),
+                format!("QEMU_BIN={QEMU_CONTAINER_PATH}"),
+            ]
+        );
+
+        let non_executable = directory.path().join("not executable");
+        std::fs::write(&non_executable, "not executable").unwrap();
+        assert!(resolve_qemu_override(non_executable.to_str().unwrap()).is_err());
+        assert!(resolve_qemu_override(directory.path().to_str().unwrap()).is_err());
+        assert!(resolve_qemu_override("/does/not/exist").is_err());
+    }
+
+    #[test]
+    fn test_qemu_override_selection() {
+        assert_eq!(
+            select_qemu_override(None, Some("/host/qemu".into())).unwrap(),
+            Some("/host/qemu".to_owned())
+        );
+        assert_eq!(
+            select_qemu_override(Some("/cli/qemu".to_owned()), Some("/host/qemu".into())).unwrap(),
+            Some("/cli/qemu".to_owned())
+        );
+        assert_eq!(select_qemu_override(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_qemu_override_env_conflict() {
+        for (env, expected) in [
+            (vec!["QEMU_BIN".to_owned()], Some("QEMU_BIN")),
+            (
+                vec!["OTHER=value".to_owned(), "QEMU_BIN=/tmp/qemu".to_owned()],
+                Some("QEMU_BIN=/tmp/qemu"),
+            ),
+            (vec!["qemu_bin=/tmp/qemu".to_owned()], None),
+            (vec!["OTHER=value".to_owned()], None),
+        ] {
+            assert_eq!(qemu_override_env_conflict(&env), expected);
+        }
+    }
+
+    #[test]
+    fn test_podman_command_forwards_toolbox_fds() {
+        let command = podman_command(2, true);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("flatpak-spawn"));
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "--host",
+                "--forward-fd=3",
+                "--forward-fd=4",
+                "/usr/bin/podman"
+            ]
+        );
+        assert_eq!(
+            podman_command(0, false).get_program(),
+            std::ffi::OsStr::new("podman")
+        );
+    }
 
     #[test]
     fn test_journal_json_to_text() {
