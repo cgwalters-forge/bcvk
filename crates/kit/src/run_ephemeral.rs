@@ -133,6 +133,17 @@ const IGNITION_SERIAL_NAME: &str = "ignition";
 /// Mount path for Ignition config inside the container
 const IGNITION_CONFIG_MOUNT_PATH: &str = "/run/ignition-config.json";
 
+/// Name of the host mount used for `--bind-storage-ro`.
+pub(crate) const HOST_STORAGE_MOUNT_NAME: &str = "hoststorage";
+
+/// Container log for the virtiofsd serving the guest root filesystem.
+pub(crate) const ROOTFS_VIRTIOFSD_LOG: &str = "/run/virtiofsd.log";
+
+/// Container log for the virtiofsd serving a host mount.
+pub(crate) fn host_mount_virtiofsd_log(name: &str) -> String {
+    format!("/run/virtiofsd-{name}.log")
+}
+
 /// Kernel initramfs magic marker for bootconfig trailer.
 const BOOTCONFIG_MAGIC: &[u8; 12] = b"#BOOTCONFIG\n";
 
@@ -739,7 +750,11 @@ fn prepare_run_command_with_temp(
             "Adding container storage from {} as hoststorage mount",
             storage_path
         );
-        host_mounts.push((storage_path.to_string(), "hoststorage".to_string(), true));
+        host_mounts.push((
+            storage_path.to_string(),
+            HOST_STORAGE_MOUNT_NAME.to_string(),
+            true,
+        ));
         // true = read-only
     }
 
@@ -1585,7 +1600,7 @@ pub(crate) async fn run_impl(opts: RunEphemeralOpts) -> Result<()> {
                 shared_dir: source_path,
                 debug: false,
                 readonly: is_readonly,
-                log_file: Some(format!("/run/virtiofsd-{}.log", mount_name_str).into()),
+                log_file: Some(host_mount_virtiofsd_log(&mount_name_str).into()),
                 virtiofsd_binary: opts.common.virtiofsd_binary.as_deref().map(Into::into),
             };
             additional_mounts.push((virtiofsd_config, tag.clone()));
@@ -1736,7 +1751,7 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     let mut main_virtiofsd_config = qemu::VirtiofsConfig::default();
     main_virtiofsd_config.debug = std::env::var("DEBUG_MODE").is_ok();
     // Always log virtiofsd output for debugging
-    main_virtiofsd_config.log_file = Some("/run/virtiofsd.log".into());
+    main_virtiofsd_config.log_file = Some(ROOTFS_VIRTIOFSD_LOG.into());
     main_virtiofsd_config.virtiofsd_binary =
         opts.common.virtiofsd_binary.as_deref().map(Into::into);
 

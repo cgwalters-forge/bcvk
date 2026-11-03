@@ -1,13 +1,22 @@
 //! SSH integration for bcvk VMs
 
 use camino::{Utf8Path, Utf8PathBuf};
-use color_eyre::{eyre::eyre, Result};
+use color_eyre::{
+    eyre::{eyre, Context},
+    Result,
+};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::CONTAINER_STATEDIR;
+
+// Diagnostic logs can be huge on a failing host. Bound each stream's in-memory
+// capture so diagnostics cannot OOM the process before install cleanup.
+const MAX_DIAGNOSTIC_BYTES: u64 = 4 * 1024 * 1024;
 
 pub use crate::ssh_options::{CommonSshOptions, SshConnectionOptions};
 
@@ -178,7 +187,6 @@ pub fn connect(
 
 /// Result of running an SSH command with captured output.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct CapturedSshOutput {
     /// Process exit code (-1 if terminated by signal)
     pub exit_code: i32,
@@ -191,12 +199,14 @@ pub struct CapturedSshOutput {
 /// Execute an SSH command inside a container, capturing stdout and stderr.
 ///
 /// Like [`connect`] but returns the output instead of passing it through
-/// to the terminal. Intended for programmatic/IPC use.
-#[allow(dead_code)]
-pub fn connect_captured(container_name: &str, args: Vec<String>) -> Result<CapturedSshOutput> {
+/// to the terminal. The timeout bounds the local podman exec, including SSH
+/// connection setup. The remote command may continue until container cleanup.
+pub fn connect_captured(
+    container_name: &str,
+    args: Vec<String>,
+    timeout: Duration,
+) -> Result<CapturedSshOutput> {
     debug!("Executing captured SSH in container: {}", container_name);
-
-    verify_container_running(container_name)?;
 
     let options = SshConnectionOptions {
         allocate_tty: false,
@@ -204,16 +214,82 @@ pub fn connect_captured(container_name: &str, args: Vec<String>) -> Result<Captu
         common: CommonSshOptions::default(),
     };
     let mut cmd = build_podman_ssh_command(container_name, &args, &options)?;
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let output = cmd
-        .output()
-        .map_err(|e| eyre!("Failed to execute SSH command: {}", e))?;
+    // Exec itself reports a missing/stopped container; avoid an unbounded inspect.
+    let output = capture_with_timeout(&mut cmd, timeout)?;
 
     Ok(CapturedSshOutput {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+/// Bound diagnostic subprocesses so a wedged guest or podman cannot indefinitely
+/// delay install cleanup. Anonymous files avoid pipe backpressure while polling.
+pub(crate) fn capture_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    let mut stdout = tempfile::tempfile().context("Creating diagnostic stdout file")?;
+    let mut stderr = tempfile::tempfile().context("Creating diagnostic stderr file")?;
+    cmd.stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
+    let mut child = cmd.spawn().context("Starting diagnostic command")?;
+    let start = Instant::now();
+    let mut interrupted = None;
+    let waited = (|| -> Result<_> {
+        loop {
+            if let Some(status) = child.try_wait().context("Waiting for diagnostic command")? {
+                return Ok(status);
+            }
+            if start.elapsed() >= timeout {
+                interrupted = Some(format!("Diagnostic command timed out after {timeout:?}"));
+                break;
+            }
+            if stdout.metadata()?.len() > MAX_DIAGNOSTIC_BYTES
+                || stderr.metadata()?.len() > MAX_DIAGNOSTIC_BYTES
+            {
+                interrupted = Some("Diagnostic command exceeded capture size limit".into());
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL.min(timeout.saturating_sub(start.elapsed())));
+        }
+        Err(eyre!("Diagnostic capture interrupted"))
+    })();
+    let status = match waited {
+        Ok(status) => status,
+        Err(e) => {
+            if let Err(e) = child.kill() {
+                debug!("Killing diagnostic command: {e}");
+            }
+            let status = child.wait().context("Reaping diagnostic command")?;
+            if interrupted.is_none() {
+                return Err(e);
+            }
+            status
+        }
+    };
+    let read = |file: &mut fs::File| -> Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        (&mut *file)
+            .take(MAX_DIAGNOSTIC_BYTES)
+            .read_to_end(&mut bytes)?;
+        if file.metadata()?.len() > MAX_DIAGNOSTIC_BYTES {
+            bytes.extend_from_slice(b"\n(diagnostic capture truncated at 4 MiB)\n");
+        }
+        Ok(bytes)
+    };
+    let mut stderr = read(&mut stderr)?;
+    if let Some(reason) = interrupted {
+        stderr.extend_from_slice(format!("\n{reason}\n").as_bytes());
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: read(&mut stdout)?,
+        stderr,
     })
 }
 
@@ -287,6 +363,44 @@ fn build_ssh_command(args: &[String]) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn diagnostic_capture_status_and_timeout() {
+        for code in [0, 9] {
+            let script = format!("printf out; printf err >&2; exit {code}");
+            let output = capture_with_timeout(
+                Command::new("sh").args(["-c", &script]),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(output.status.code(), Some(code));
+            assert_eq!(output.stdout, b"out");
+            assert_eq!(output.stderr, b"err");
+        }
+        let start = Instant::now();
+        let output = capture_with_timeout(
+            Command::new("sh").args(["-c", "printf partial; exec sleep 60"]),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(output.stdout, b"partial");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn diagnostic_capture_size_limit() {
+        let output = capture_with_timeout(
+            Command::new("head").args(["-c", "8388608", "/dev/zero"]),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.stdout.len() <= MAX_DIAGNOSTIC_BYTES as usize + 100);
+        assert!(output
+            .stdout
+            .ends_with(b"(diagnostic capture truncated at 4 MiB)\n"));
+    }
 
     #[test]
     fn test_generate_ssh_keypair() {

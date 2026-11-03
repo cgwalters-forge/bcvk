@@ -73,11 +73,15 @@
 //!     quay.io/centos-bootc/centos-bootc:stream10 output.img
 //! ```
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
+use std::time::Duration;
 
 use crate::cache_metadata::DiskImageMetadata;
 use crate::install_options::InstallOptions;
-use crate::run_ephemeral::{run_detached, CommonVmOpts, RunEphemeralOpts};
+use crate::run_ephemeral::{
+    host_mount_virtiofsd_log, run_detached, CommonVmOpts, RunEphemeralOpts,
+    HOST_STORAGE_MOUNT_NAME, ROOTFS_VIRTIOFSD_LOG,
+};
 use crate::run_ephemeral_ssh::wait_for_ssh_ready;
 use crate::{images, ssh, utils};
 use camino::Utf8PathBuf;
@@ -88,6 +92,15 @@ use indicatif::HumanDuration;
 use indoc::indoc;
 use tempfile::TempDir;
 use tracing::debug;
+
+/// Opt in to stderr tails in test reports, rather than only a saved-file notice.
+pub const PRINT_FAILURE_LOGS_ENV: &str = "BCVK_PRINT_FAILURE_LOGS";
+
+// Bound cleanup delay if the guest or a podman exec is wedged (three captures).
+const FAILURE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+const FAILURE_LOG_MAX_LINES: usize = 200;
+// A line limit alone does not bound output when a log contains a huge line.
+const FAILURE_LOG_MAX_BYTES: usize = 32 * 1024;
 
 /// Supported disk image formats
 #[derive(Debug, Clone, ValueEnum, PartialEq, Default)]
@@ -615,6 +628,11 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
         Ok(())
     })();
 
+    // Collect before removal; diagnostics must never replace the install error.
+    if result.is_err() {
+        save_failure_diagnostics(&container_id);
+    }
+
     // Cleanup: stop and remove the container
     debug!("Cleaning up ephemeral container...");
     let _ = std::process::Command::new("podman")
@@ -642,6 +660,184 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
             let _ = std::fs::remove_file(&opts.target_disk);
             Err(e)
         }
+    }
+}
+
+/// Format a log tail, with both line and byte bounds for terminal/test output.
+fn format_log_tail(title: &str, content: &str, max_lines: usize, max_bytes: usize) -> String {
+    let lines: Vec<_> = content.lines().collect();
+    let omitted = lines.len().saturating_sub(max_lines);
+    let mut out = if omitted > 0 {
+        format!(
+            "----- {title} (last {max_lines} of {} lines) -----\n",
+            lines.len()
+        )
+    } else {
+        format!("----- {title} -----\n")
+    };
+    let tail = lines[omitted..].join("\n");
+    let mut start = tail.len().saturating_sub(max_bytes);
+    while !tail.is_char_boundary(start) {
+        start += 1;
+    }
+    if start > 0 {
+        out.push_str("(byte-truncated tail)\n");
+    }
+    if lines.is_empty() {
+        out.push_str("(empty)\n");
+    } else if !tail[start..].is_empty() {
+        out.push_str(&tail[start..]);
+        out.push('\n');
+    }
+    out
+}
+
+type FailureLogs = Vec<(String, Result<String>)>;
+
+fn format_failure_diagnostics(logs: &[(String, Result<String>)], tails: bool) -> String {
+    logs.iter()
+        .map(|(title, content)| match content {
+            Ok(content) => format_log_tail(
+                title,
+                content,
+                if tails {
+                    FAILURE_LOG_MAX_LINES
+                } else {
+                    usize::MAX
+                },
+                if tails {
+                    FAILURE_LOG_MAX_BYTES
+                } else {
+                    usize::MAX
+                },
+            ),
+            Err(e) => format_log_tail(
+                title,
+                &format!("unavailable: {e:#}"),
+                1,
+                FAILURE_LOG_MAX_BYTES,
+            ),
+        })
+        .collect()
+}
+
+fn collect_failure_diagnostics(container_id: &str) -> FailureLogs {
+    let dmesg = ssh::connect_captured(container_id, vec!["dmesg".into()], FAILURE_CAPTURE_TIMEOUT)
+        .and_then(|output| {
+            if output.exit_code != 0 {
+                return partial_capture(
+                    output.stdout,
+                    format!(
+                        "dmesg exited with code {}: {}",
+                        output.exit_code,
+                        output.stderr.trim()
+                    ),
+                );
+            }
+            Ok(output.stdout)
+        });
+    let mut logs = vec![("guest kernel log (dmesg)".into(), dmesg)];
+    for (name, path) in [
+        (
+            "host storage",
+            host_mount_virtiofsd_log(HOST_STORAGE_MOUNT_NAME),
+        ),
+        ("root filesystem", ROOTFS_VIRTIOFSD_LOG.to_string()),
+    ] {
+        let result = ssh::capture_with_timeout(
+            std::process::Command::new("podman").args([
+                "exec",
+                "--",
+                container_id,
+                "cat",
+                "--",
+                &path,
+            ]),
+            FAILURE_CAPTURE_TIMEOUT,
+        )
+        .and_then(|output| {
+            if !output.status.success() {
+                return partial_capture(
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                    format!(
+                        "Reading {path}: {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                );
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        });
+        logs.push((format!("virtiofsd log for {name} ({path})"), result));
+    }
+    logs
+}
+
+/// Keep evidence emitted before a timeout/nonzero exit, marking it incomplete.
+fn partial_capture(stdout: String, error: String) -> Result<String> {
+    if stdout.is_empty() {
+        Err(eyre!(error))
+    } else {
+        Ok(format!("{stdout}\n(capture incomplete: {error})\n"))
+    }
+}
+
+fn write_failure_log(contents: &str) -> Result<std::path::PathBuf> {
+    let mut file = tempfile::Builder::new()
+        .prefix("bcvk-to-disk-failure-")
+        .suffix(".log")
+        .tempfile()
+        .context("Creating failure log")?;
+    file.write_all(contents.as_bytes())
+        .context("Writing failure log")?;
+    file.as_file().sync_all().context("Syncing failure log")?;
+    let (_, path) = file.keep().context("Keeping failure log")?;
+    Ok(path)
+}
+
+/// Separate reporting from collection so save failures and partial logs are
+/// testable without a VM. Even a broken stderr must not interrupt cleanup.
+fn report_failure_diagnostics(
+    logs: &[(String, Result<String>)],
+    print: bool,
+    save: impl FnOnce(&str) -> Result<std::path::PathBuf>,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    if logs.iter().all(|(_, content)| content.is_err()) {
+        for (title, content) in logs {
+            debug!("Install VM {title}: {content:?}");
+        }
+        if print {
+            write!(out, "{}", format_failure_diagnostics(logs, true))?;
+        }
+        return Ok(());
+    }
+    let saved = save(&format_failure_diagnostics(logs, false));
+    match &saved {
+        Ok(path) => writeln!(
+            out,
+            "Logs from the failed install VM were saved to {}",
+            path.display()
+        )?,
+        Err(e) => writeln!(out, "Failed to save logs from the failed install VM: {e:#}")?,
+    }
+    if print || saved.is_err() {
+        write!(out, "{}", format_failure_diagnostics(logs, true))?;
+    }
+    Ok(())
+}
+
+fn save_failure_diagnostics(container_id: &str) {
+    let logs = collect_failure_diagnostics(container_id);
+    let print = tracing::enabled!(tracing::Level::DEBUG)
+        || std::env::var_os(PRINT_FAILURE_LOGS_ENV).is_some_and(|v| !v.is_empty());
+    if let Err(e) = report_failure_diagnostics(
+        &logs,
+        print,
+        write_failure_log,
+        &mut std::io::stderr().lock(),
+    ) {
+        debug!("Reporting install diagnostics: {e}");
     }
 }
 
@@ -685,6 +881,79 @@ fn write_disk_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_log_tails() {
+        for (content, lines, bytes, expected) in [
+            ("", 3, 100, "----- t -----\n(empty)\n"),
+            ("a\nb", 3, 100, "----- t -----\na\nb\n"),
+            (
+                "a\nb\nc\n",
+                2,
+                100,
+                "----- t (last 2 of 3 lines) -----\nb\nc\n",
+            ),
+            ("a\r\nb\r\n", 3, 100, "----- t -----\na\nb\n"),
+            ("a\nb\n", 0, 100, "----- t (last 0 of 2 lines) -----\n"),
+            ("aébc", 3, 3, "----- t -----\n(byte-truncated tail)\nbc\n"),
+        ] {
+            assert_eq!(format_log_tail("t", content, lines, bytes), expected);
+        }
+    }
+
+    #[test]
+    fn failure_log_reporting() {
+        for (content, print, save_fails, expected) in [
+            (Some("hello"), false, false, "Logs from the failed install VM were saved to /saved.log\n"),
+            (Some(""), true, false, "Logs from the failed install VM were saved to /saved.log\n----- guest -----\n(empty)\n----- host -----\nunavailable: gone\n"),
+            (Some("hello"), false, true, "Failed to save logs from the failed install VM: full\n----- guest -----\nhello\n----- host -----\nunavailable: gone\n"),
+            (None, false, false, ""),
+            (None, true, false, "----- guest -----\nunavailable: offline\n----- host -----\nunavailable: gone\n"),
+        ] {
+            let logs = vec![
+                ("guest".into(), content.map(str::to_owned).ok_or_else(|| eyre!("offline"))),
+                ("host".into(), Err(eyre!("gone"))),
+            ];
+            let mut out = Vec::new();
+            let mut saves = 0;
+            report_failure_diagnostics(&logs, print, |text| {
+                saves += 1;
+                assert_eq!(text, format_failure_diagnostics(&logs, false));
+                if save_fails { Err(eyre!("full")) } else { Ok("/saved.log".into()) }
+            }, &mut out).unwrap();
+            assert_eq!(saves, usize::from(content.is_some()));
+            assert_eq!(String::from_utf8(out).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn partial_failure_capture() {
+        for content in ["", "partial\n"] {
+            let result = partial_capture(content.into(), "timed out".into());
+            if content.is_empty() {
+                assert_eq!(result.unwrap_err().to_string(), "timed out");
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    "partial\n\n(capture incomplete: timed out)\n"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failure_log_survives_writer_and_stderr_failure() {
+        let path = write_failure_log("captured logs\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "captured logs\n");
+        std::fs::remove_file(path).unwrap();
+
+        let logs = vec![("guest".into(), Ok("log".into()))];
+        // A closed stderr is reported as an I/O error, not a panic that skips cleanup.
+        let mut closed = &mut [][..];
+        assert!(
+            report_failure_diagnostics(&logs, true, |_| Err(eyre!("full")), &mut closed).is_err()
+        );
+    }
 
     #[test]
     fn test_calculate_disk_size() -> Result<()> {

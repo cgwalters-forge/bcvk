@@ -382,6 +382,8 @@ impl BcvkService {
                 },
             };
 
+            // Failed-install log paths are reported on this server's stderr,
+            // not returned over varlink; the original install error is returned.
             let outcome = crate::to_disk::run(opts)?;
             let cached = outcome == crate::to_disk::RunOutcome::Cached;
 

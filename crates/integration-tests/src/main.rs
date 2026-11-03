@@ -28,7 +28,11 @@ mod tests {
 
 /// Create a new xshell Shell for running commands
 pub(crate) fn shell() -> anyhow::Result<Shell> {
-    Shell::new().map_err(|e| anyhow!("Failed to create shell: {}", e))
+    let sh = Shell::new().map_err(|e| anyhow!("Failed to create shell: {}", e))?;
+    // Include bounded failure-log tails in captured CI output. Set this on the
+    // command environment, not the process environment after harness threads start.
+    sh.set_var("BCVK_PRINT_FAILURE_LOGS", "1");
+    Ok(sh)
 }
 
 /// Get the path to the bcvk binary, checking BCVK_PATH env var first, then falling back to "bcvk"

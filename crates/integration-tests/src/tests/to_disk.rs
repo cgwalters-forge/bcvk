@@ -17,7 +17,7 @@
 use std::process::Output;
 
 use camino::Utf8PathBuf;
-use integration_tests::{integration_test, parameterized_integration_test};
+use integration_tests::{integration_test, output_or_bail, parameterized_integration_test};
 use itest::TestResult;
 use xshell::{cmd, Shell};
 
@@ -90,7 +90,10 @@ fn test_to_disk() -> TestResult {
     let disk_path = Utf8PathBuf::try_from(temp_dir.path().join("test-disk.img"))
         .expect("temp path is not UTF-8");
 
-    let output = cmd!(sh, "{bck} to-disk --label {label} {image} {disk_path}").output()?;
+    let output = output_or_bail(cmd!(
+        sh,
+        "{bck} to-disk --label {label} {image} {disk_path}"
+    ))?;
     validate_disk_image(&disk_path, &output, "test_to_disk")?;
     Ok(())
 }
@@ -107,11 +110,10 @@ fn test_to_disk_qcow2() -> TestResult {
     let disk_path = Utf8PathBuf::try_from(temp_dir.path().join("test-disk.qcow2"))
         .expect("temp path is not UTF-8");
 
-    let output = cmd!(
+    let output = output_or_bail(cmd!(
         sh,
         "{bck} to-disk --format=qcow2 --label {label} {image} {disk_path}"
-    )
-    .output()?;
+    ))?;
 
     // Verify the file is actually qcow2 format using qemu-img info
     let qemu_img_stdout = cmd!(sh, "qemu-img info {disk_path}").read()?;
@@ -139,7 +141,10 @@ fn test_to_disk_caching() -> TestResult {
         .expect("temp path is not UTF-8");
 
     // First run: Create the disk image
-    let output1 = cmd!(sh, "{bck} to-disk --label {label} {image} {disk_path}").output()?;
+    let output1 = output_or_bail(cmd!(
+        sh,
+        "{bck} to-disk --label {label} {image} {disk_path}"
+    ))?;
     let stdout1 = String::from_utf8_lossy(&output1.stdout);
     let stderr1 = String::from_utf8_lossy(&output1.stderr);
 
@@ -153,7 +158,10 @@ fn test_to_disk_caching() -> TestResult {
     );
 
     // Second run: Should reuse the cached disk
-    let output2 = cmd!(sh, "{bck} to-disk --label {label} {image} {disk_path}").output()?;
+    let output2 = output_or_bail(cmd!(
+        sh,
+        "{bck} to-disk --label {label} {image} {disk_path}"
+    ))?;
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
 
@@ -206,11 +214,10 @@ fn test_to_disk_different_imgref_same_digest() -> TestResult {
 
     // Use --dry-run with the aliased image reference (same digest, different imgref)
     // to verify it would regenerate instead of reusing the cache
-    let output2 = cmd!(
+    let output2 = output_or_bail(cmd!(
         sh,
         "{bck} to-disk --dry-run --label {label} {second_tag} {disk_path}"
-    )
-    .output()?;
+    ))?;
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
 
@@ -245,11 +252,10 @@ fn test_to_disk_bootc_install_podman_arg() -> TestResult {
 
     // Pass an innocuous podman label arg - this exercises the new flag without
     // affecting the installation outcome.
-    let output = cmd!(
+    let output = output_or_bail(cmd!(
         sh,
         "{bck} to-disk --label {label} --bootc-install-podman-arg=--label=bcvk-test=1 {image} {disk_path}"
-    )
-    .output()?;
+    ))?;
 
     validate_disk_image(&disk_path, &output, "test_to_disk_bootc_install_podman_arg")?;
     Ok(())
@@ -270,11 +276,10 @@ fn test_to_disk_for_image(image: &str) -> TestResult {
         .expect("temp path is not UTF-8");
 
     // Not all images have a default filesystem, so explicitly specify ext4
-    let output = cmd!(
+    let output = output_or_bail(cmd!(
         sh,
         "{bck} to-disk --label {label} --filesystem=ext4 {image} {disk_path}"
-    )
-    .output()?;
+    ))?;
 
     validate_disk_image(
         &disk_path,
@@ -336,11 +341,10 @@ fn test_to_disk_quadlet() -> TestResult {
     let disk_path = Utf8PathBuf::try_from(temp_dir.path().join("test-disk.img"))
         .expect("temp path is not UTF-8");
 
-    let output = cmd!(
+    let output = output_or_bail(cmd!(
         sh,
         "{bck} to-disk --label {label} --filesystem ext4 {QUADLET_IMAGE} {disk_path}"
-    )
-    .output()?;
+    ))?;
 
     validate_disk_image(&disk_path, &output, "test_to_disk_quadlet")?;
     Ok(())
