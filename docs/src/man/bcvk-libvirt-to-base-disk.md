@@ -45,9 +45,9 @@ Create a base disk image for libvirt VMs
 
     Which bootloader to use for composefs-native backend
 
-**--allow-missing-fsverity**
+**--allow-missing-verity**
 
-    Allow installation without fs-verity support for composefs-native backend
+    Allow installation without fs-verity support for the composefs-native backend, whether selected by the image or --composefs-backend. Requires bootc >= 1.17.0 for image-selected composefs. Alias: --allow-missing-fsverity
 
 <!-- END GENERATED OPTIONS -->
 

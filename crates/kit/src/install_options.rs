@@ -48,9 +48,11 @@ pub struct InstallOptions {
     #[clap(long, requires = "composefs_backend")]
     pub bootloader: Option<String>,
 
-    /// Allow installation without fs-verity support for composefs-native
-    /// backend
-    #[clap(long, requires = "composefs_backend")]
+    /// Allow installation without fs-verity support for the composefs-native
+    /// backend, whether selected by the image or --composefs-backend.
+    /// Requires bootc >= 1.17.0 for image-selected composefs.
+    /// Alias: --allow-missing-fsverity.
+    #[clap(long = "allow-missing-verity", visible_alias = "allow-missing-fsverity")]
     pub allow_missing_fsverity: bool,
 }
 
@@ -88,9 +90,38 @@ impl InstallOptions {
         }
 
         if self.allow_missing_fsverity {
-            args.push("--allow-missing-fsverity".into());
+            args.push("--allow-missing-verity".into());
         }
 
         args
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verity_options() {
+        let defaults = InstallOptions::try_parse_from(["bcvk"]).unwrap();
+        assert!(!defaults.allow_missing_fsverity);
+        assert!(defaults.to_bootc_args().is_empty());
+
+        for flag in ["--allow-missing-verity", "--allow-missing-fsverity"] {
+            for explicit_backend in [false, true] {
+                let mut argv = vec!["bcvk", flag];
+                let mut expected = vec![];
+                if explicit_backend {
+                    argv.push("--composefs-backend");
+                    expected.push("--composefs-backend");
+                }
+                expected.push("--allow-missing-verity");
+
+                let options = InstallOptions::try_parse_from(argv).unwrap();
+                assert!(options.allow_missing_fsverity);
+                assert_eq!(options.composefs_backend, explicit_backend);
+                assert_eq!(options.to_bootc_args(), expected);
+            }
+        }
     }
 }
