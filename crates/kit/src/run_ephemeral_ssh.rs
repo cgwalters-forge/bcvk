@@ -325,7 +325,7 @@ pub fn run_ephemeral_ssh(opts: RunEphemeralSshOpts) -> Result<()> {
     // Start the ephemeral pod in detached mode with SSH enabled
     let mut ephemeral_opts = opts.run_opts.clone();
     ephemeral_opts.podman.detach = true;
-    ephemeral_opts.common.ssh_keygen = true; // Enable SSH key generation and access
+    ephemeral_opts.session.ssh_keygen = true; // Enable SSH key generation and access
 
     debug!("Starting ephemeral VM...");
     let container_id = run_detached(ephemeral_opts)?;

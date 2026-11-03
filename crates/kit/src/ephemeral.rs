@@ -76,7 +76,7 @@ pub struct SshOpts {
 #[derive(clap::Parser, Debug)]
 pub struct TestBasicOpts {
     #[command(flatten)]
-    pub run_opts: run_ephemeral::RunEphemeralOpts,
+    pub run_opts: run_ephemeral::EphemeralVmOpts,
 }
 
 /// Container list entry for ephemeral VMs
@@ -214,7 +214,7 @@ impl EphemeralCommands {
             EphemeralCommands::Run(opts) => run_ephemeral::run(opts),
             EphemeralCommands::RunSsh(opts) => run_ephemeral_ssh::run_ephemeral_ssh(opts),
             // The options were parsed only to validate them (and for --help);
-            // run-ssh takes the same ones, straight from our argv.
+            // run-ssh accepts this subset, straight from our argv.
             EphemeralCommands::TestBasic(_) => test_basic(),
             EphemeralCommands::Ssh(opts) => {
                 // Create progress bar if stderr is a terminal
@@ -421,6 +421,128 @@ fn remove_all_ephemeral_containers(force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{error::ErrorKind, CommandFactory, Parser};
+
+    #[test]
+    fn session_options_are_only_for_direct_runs() {
+        let cases: &[&[&str]] = &[
+            &["--tty"],
+            &["--interactive"],
+            &["--detach"],
+            &["--rm"],
+            &["--name", "test-vm"],
+            &["--console"],
+            &["--debug"],
+            &["--execute", "true"],
+            &["--ssh-keygen"],
+            &["--debug-entrypoint", "bash"],
+            &["-t"],
+            &["-i"],
+            &["-d"],
+            &["-K"],
+        ];
+        for flags in cases {
+            for command in ["run", "run-ssh"] {
+                let args = ["bcvk", "ephemeral", command, "img"]
+                    .into_iter()
+                    .chain(flags.iter().copied());
+                crate::Cli::try_parse_from(args).unwrap();
+            }
+            for prefix in [
+                &["bcvk", "ephemeral", "test-basic", "img"][..],
+                &["bcvk", "to-disk", "img", "disk.raw"][..],
+            ] {
+                let err = crate::Cli::try_parse_from(prefix.iter().chain(flags.iter()))
+                    .err()
+                    .expect("session option must be rejected");
+                assert_eq!(
+                    err.kind(),
+                    ErrorKind::UnknownArgument,
+                    "{prefix:?} {flags:?}"
+                );
+            }
+        }
+
+        // Man pages are generated from these same clap argument definitions.
+        let cli = crate::Cli::command();
+        let test_basic = cli
+            .find_subcommand("ephemeral")
+            .unwrap()
+            .find_subcommand(TEST_BASIC_CMD)
+            .unwrap();
+        let to_disk = cli.find_subcommand("to-disk").unwrap();
+        for command in [test_basic, to_disk] {
+            for flags in &cases[..10] {
+                let long = flags[0].trim_start_matches("--");
+                assert!(!command
+                    .get_arguments()
+                    .any(|arg| arg.get_long() == Some(long)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_basic_shared_options_round_trip() {
+        let args = [
+            "ephemeral",
+            "test-basic",
+            "--itype",
+            "u1.small",
+            "--memory",
+            "4G",
+            "--vcpus",
+            "2",
+            "--network",
+            "host",
+            "--label",
+            "k=v",
+            "--env",
+            "A=B",
+            "--bind",
+            ".:src",
+            "--ro-bind",
+            ".:data",
+            "--systemd-units",
+            "/units",
+            "--bind-storage-ro",
+            "--add-swap",
+            "1G",
+            "--mount-disk-file",
+            "disk:data",
+            "--karg",
+            "systemd.volatile=overlay",
+            "--ignition",
+            "/config.json",
+            "--virtiofsd",
+            "/usr/bin/virtiofsd",
+            "--output",
+            "journal",
+            "--log-dir",
+            "journal,console=/tmp/logs",
+            "--virtio-serial-out",
+            "test:/tmp/out",
+            "img",
+        ];
+        let parsed = TestBasicOpts::try_parse_from(
+            [TEST_BASIC_CMD]
+                .into_iter()
+                .chain(args[2..].iter().copied()),
+        )
+        .unwrap();
+        let forwarded = test_basic_run_ssh_args(args.map(Into::into)).unwrap();
+        let forwarded =
+            crate::Cli::try_parse_from([OsString::from("bcvk")].into_iter().chain(forwarded))
+                .unwrap();
+        let crate::Commands::Ephemeral(EphemeralCommands::RunSsh(forwarded)) = forwarded.command
+        else {
+            panic!("expected run-ssh");
+        };
+        assert_eq!(
+            serde_json::to_value(parsed.run_opts).unwrap(),
+            serde_json::to_value(forwarded.run_opts.vm).unwrap(),
+        );
+        assert_eq!(forwarded.ssh_args, ["/bin/sh", "-c", &test_basic_script()]);
+    }
 
     #[test]
     fn test_basic_args_to_run_ssh() {
@@ -444,16 +566,8 @@ mod tests {
                 &["--memory", "4G", "--label", "k=v", "img", "--"],
             ),
             (
-                &[
-                    "ephemeral",
-                    "test-basic",
-                    "--memory=8G",
-                    "-K",
-                    "-e",
-                    "A=B",
-                    "img",
-                ],
-                &["--memory=8G", "-K", "-e", "A=B", "img", "--"],
+                &["ephemeral", "test-basic", "--memory=8G", "-e", "A=B", "img"],
+                &["--memory=8G", "-e", "A=B", "img", "--"],
             ),
             // A separator the user already gave is reused
             (&["ephemeral", "test-basic", "img", "--"], &["img", "--"]),

@@ -63,25 +63,9 @@ and print an error on stderr.
 
     Number of vCPUs (overridden by --itype if specified)
 
-**--console**
-
-    Connect the QEMU console to the container's stdio (visible via podman logs/attach)
-
-**--debug**
-
-    Enable debug mode (drop to shell instead of running QEMU)
-
 **--virtio-serial-out**=*NAME:FILE*
 
     Add virtio-serial device with output to file (format: name:/path/to/file)
-
-**--execute**=*EXECUTE*
-
-    Execute command inside VM via systemd and capture output
-
-**-K**, **--ssh-keygen**
-
-    Generate SSH keypair and inject via systemd credentials
 
 **--virtiofsd**=*VIRTIOFSD_BINARY*
 
@@ -101,26 +85,6 @@ and print an error on stderr.
 
     Write VM log streams to files in DIR
 
-**-t**, **--tty**
-
-    Allocate a pseudo-TTY for container
-
-**-i**, **--interactive**
-
-    Keep STDIN open for container
-
-**-d**, **--detach**
-
-    Run container in background
-
-**--rm**
-
-    Automatically remove container when it exits
-
-**--name**=*NAME*
-
-    Assign a name to the container
-
 **--network**=*NETWORK*
 
     Configure the network for the container
@@ -132,10 +96,6 @@ and print an error on stderr.
 **-e**, **--env**=*ENV*
 
     Set environment variables in the container (key=value)
-
-**--debug-entrypoint**=*DEBUG_ENTRYPOINT*
-
-    Do not run the default entrypoint directly, but instead invoke the provided command (e.g. `bash`)
 
 **--bind**=*HOST_PATH[:NAME]*
 

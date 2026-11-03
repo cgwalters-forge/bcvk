@@ -380,7 +380,11 @@ pub struct CommonPodmanOptions {
 
     #[clap(long = "name", help = "Assign a name to the container")]
     pub name: Option<String>,
+}
 
+/// Container settings shared by ephemeral VM callers.
+#[derive(Parser, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommonContainerOpts {
     #[clap(long = "network", help = "Configure the network for the container")]
     pub network: Option<String>,
 
@@ -414,36 +418,11 @@ pub struct CommonVmOpts {
     pub vcpus: Option<u32>,
 
     #[clap(
-        long,
-        help = "Connect the QEMU console to the container's stdio (visible via podman logs/attach)"
-    )]
-    pub console: bool,
-
-    #[clap(
-        long,
-        help = "Enable debug mode (drop to shell instead of running QEMU)"
-    )]
-    pub debug: bool,
-
-    #[clap(
         long = "virtio-serial-out",
         value_name = "NAME:FILE",
         help = "Add virtio-serial device with output to file (format: name:/path/to/file)"
     )]
     pub virtio_serial_out: Vec<String>,
-
-    #[clap(
-        long,
-        help = "Execute command inside VM via systemd and capture output"
-    )]
-    pub execute: Vec<String>,
-
-    #[clap(
-        long,
-        short = 'K',
-        help = "Generate SSH keypair and inject via systemd credentials"
-    )]
-    pub ssh_keygen: bool,
 
     #[clap(
         long = "virtiofsd",
@@ -496,6 +475,57 @@ impl CommonVmOpts {
 /// Ephemeral VM options: container-style flags, host bind mounts, systemd injection.
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct RunEphemeralOpts {
+    /// Shared VM boot settings.
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub vm: EphemeralVmOpts,
+
+    /// Container lifecycle controls.
+    #[clap(flatten)]
+    pub podman: CommonPodmanOptions,
+
+    /// Interactive and debugging controls.
+    #[clap(flatten)]
+    pub session: VmSessionOpts,
+}
+
+/// Session controls for direct ephemeral run and run-ssh invocations.
+#[derive(Parser, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VmSessionOpts {
+    #[clap(
+        long,
+        help = "Connect the QEMU console to the container's stdio (visible via podman logs/attach)"
+    )]
+    pub console: bool,
+
+    #[clap(
+        long,
+        help = "Enable debug mode (drop to shell instead of running QEMU)"
+    )]
+    pub debug: bool,
+
+    #[clap(
+        long,
+        help = "Execute command inside VM via systemd and capture output"
+    )]
+    pub execute: Vec<String>,
+
+    #[clap(
+        long,
+        short = 'K',
+        help = "Generate SSH keypair and inject via systemd credentials"
+    )]
+    pub ssh_keygen: bool,
+
+    /// Do not run the default entrypoint directly, but
+    /// instead invoke the provided command (e.g. `bash`).
+    #[clap(long)]
+    pub debug_entrypoint: Option<String>,
+}
+
+/// Boot settings shared by ephemeral runs and automated VM tests.
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
+pub struct EphemeralVmOpts {
     #[clap(help = "Container image to run as ephemeral VM")]
     pub image: String,
 
@@ -503,12 +533,7 @@ pub struct RunEphemeralOpts {
     pub common: CommonVmOpts,
 
     #[clap(flatten)]
-    pub podman: CommonPodmanOptions,
-
-    /// Do not run the default entrypoint directly, but
-    /// instead invoke the provided command (e.g. `bash`).
-    #[clap(long)]
-    pub debug_entrypoint: Option<String>,
+    pub container: CommonContainerOpts,
 
     #[clap(
         long = "bind",
@@ -659,7 +684,7 @@ pub fn run_detached(opts: RunEphemeralOpts) -> Result<String> {
 /// Launch privileged container with QEMU+KVM for ephemeral VM.
 pub fn run(opts: RunEphemeralOpts) -> Result<()> {
     // Print helpful hint when running in foreground mode without console
-    if !opts.podman.detach && !opts.common.console && std::io::stderr().is_terminal() {
+    if !opts.podman.detach && !opts.session.console && std::io::stderr().is_terminal() {
         if let Some(name) = &opts.podman.name {
             eprintln!(
                 "Hint: Use 'bcvk ephemeral ssh {}' to connect, or add --console to see VM output",
@@ -689,17 +714,17 @@ fn prepare_run_command_with_temp(
     tempfile::TempDir,
     Vec<std::sync::Arc<rustix::fd::OwnedFd>>,
 )> {
-    debug!("Running QEMU inside hybrid container for {}", opts.image);
+    debug!("Running QEMU inside hybrid container for {}", opts.vm.image);
 
     // Check Ignition support early (before launching container) if --ignition is specified
-    if opts.ignition_config.is_some() {
-        let has_ignition = check_ignition_support(&opts.image)?;
+    if opts.vm.ignition_config.is_some() {
+        let has_ignition = check_ignition_support(&opts.vm.image)?;
         if !has_ignition {
             return Err(eyre!(
                 "Image does not support Ignition. See man bcvk-ephemeral-run for details."
             ));
         }
-        debug!("Image {} supports Ignition", opts.image);
+        debug!("Image {} supports Ignition", opts.vm.image);
     }
 
     let script = include_str!("../scripts/entrypoint.sh");
@@ -722,13 +747,13 @@ fn prepare_run_command_with_temp(
     let self_exe = self_exe.as_str()?;
 
     // Process disk files and create them if needed
-    let processed_disk_files = process_disk_files(&opts.mount_disk_files, &opts.image)?;
+    let processed_disk_files = process_disk_files(&opts.vm.mount_disk_files, &opts.vm.image)?;
 
     // Parse mount arguments (both bind and ro-bind)
     let mut host_mounts = Vec::new();
 
     // Add container storage mount if requested
-    if opts.bind_storage_ro {
+    if opts.vm.bind_storage_ro {
         let storage_path = utils::detect_container_storage_path().context(
             "Failed to detect container storage path. Use --ro-bind to specify manually.",
         )?;
@@ -744,7 +769,7 @@ fn prepare_run_command_with_temp(
     }
 
     // Parse writable bind mounts
-    for mount_spec in &opts.bind_mounts {
+    for mount_spec in &opts.vm.bind_mounts {
         let (host_path, mount_name) = if let Some((path, name)) = mount_spec.split_once(':') {
             (path.to_string(), name.to_string())
         } else {
@@ -759,7 +784,7 @@ fn prepare_run_command_with_temp(
     }
 
     // Parse read-only bind mounts
-    for mount_spec in &opts.ro_bind_mounts {
+    for mount_spec in &opts.vm.ro_bind_mounts {
         let (host_path, mount_name) = if let Some((path, name)) = mount_spec.split_once(':') {
             (path.to_string(), name.to_string())
         } else {
@@ -781,7 +806,7 @@ fn prepare_run_command_with_temp(
     cmd.arg("--pull=never");
     // We always have a label
     cmd.arg("--label=bcvk.ephemeral=1");
-    for label in opts.podman.label.iter() {
+    for label in opts.vm.container.label.iter() {
         cmd.arg(format!("--label={label}"));
     }
 
@@ -797,7 +822,7 @@ fn prepare_run_command_with_temp(
     }
     // Note that (unlike the libvirt flow) we rely on the default bridge network to avoid
     // port conflicts
-    if let Some(network) = opts.podman.network.as_deref() {
+    if let Some(network) = opts.vm.container.network.as_deref() {
         cmd.args(["--network", network]);
     }
     if opts.podman.rm {
@@ -812,7 +837,7 @@ fn prepare_run_command_with_temp(
     if opts.podman.detach {
         cmd.arg("-d");
     }
-    for env in opts.podman.env.iter() {
+    for env in opts.vm.container.env.iter() {
         cmd.arg(format!("--env={env}"));
     }
 
@@ -865,7 +890,7 @@ fn prepare_run_command_with_temp(
         // that we'll use as a mount source for virtiofs. Mount as rw for testing.
         &format!(
             "--mount=type=image,source={},target=/run/source-image,rw=true",
-            opts.image.as_str()
+            opts.vm.image.as_str()
         ),
     ]);
 
@@ -886,12 +911,12 @@ fn prepare_run_command_with_temp(
     }
 
     // Mount systemd units directory if specified
-    if let Some(ref units_dir) = opts.systemd_units_dir {
+    if let Some(ref units_dir) = opts.vm.systemd_units_dir {
         cmd.args(["-v", &format!("{}:/run/systemd-units:ro", units_dir)]);
     }
 
     // Mount Ignition config file if specified
-    if let Some(ref ignition_path) = opts.ignition_config {
+    if let Some(ref ignition_path) = opts.vm.ignition_config {
         // Convert to absolute path if needed
         let path = Utf8Path::new(ignition_path);
         let ignition_abs = if path.is_absolute() {
@@ -933,7 +958,7 @@ fn prepare_run_command_with_temp(
     // Pass configuration as JSON via BCK_CONFIG environment variable
     // Include host DNS servers in the config so they're available inside the container
     let mut opts_with_dns = opts.clone();
-    opts_with_dns.host_dns_servers = host_dns_servers;
+    opts_with_dns.vm.host_dns_servers = host_dns_servers;
     let config = serde_json::to_string(&opts_with_dns).unwrap();
     cmd.args(["-e", &format!("BCK_CONFIG={config}")]);
 
@@ -945,12 +970,17 @@ fn prepare_run_command_with_temp(
     // podman wrapper) ensures the fds also reach the real host podman from inside
     // a toolbox.
     let mut journal_fds: Vec<std::sync::Arc<rustix::fd::OwnedFd>> = Vec::new();
-    if opts.common.log_dir.as_ref().map_or(false, |d| d.journal) {
+    if opts.vm.common.log_dir.as_ref().map_or(false, |d| d.journal) {
         let mut fds = cap_std_ext::cmdext::CmdFds::new();
         let mut fd_nums = Vec::new();
         for dest in [
-            opts.common.log_dir.as_ref().and_then(|d| d.journal_path()),
-            opts.common
+            opts.vm
+                .common
+                .log_dir
+                .as_ref()
+                .and_then(|d| d.journal_path()),
+            opts.vm
+                .common
                 .log_dir
                 .as_ref()
                 .and_then(|d| d.journal_initrd_path()),
@@ -982,7 +1012,13 @@ fn prepare_run_command_with_temp(
     // directory into the container and tell run_impl the in-container path via
     // BCVK_CONSOLE_PATH.  QEMU writes the serial console output there directly
     // (no fd-passing needed — QEMU uses `-serial file:<path>`).
-    if let Some(console_path) = opts.common.log_dir.as_ref().and_then(|d| d.console_path()) {
+    if let Some(console_path) = opts
+        .vm
+        .common
+        .log_dir
+        .as_ref()
+        .and_then(|d| d.console_path())
+    {
         // Resolve the parent to an absolute path so the bind mount is unambiguous.
         let parent = console_path
             .parent()
@@ -1006,8 +1042,8 @@ fn prepare_run_command_with_temp(
     }
 
     // Handle --execute output files and virtio-serial devices
-    let mut all_serial_devices = opts.common.virtio_serial_out.clone();
-    if !opts.common.execute.is_empty() {
+    let mut all_serial_devices = opts.vm.common.virtio_serial_out.clone();
+    if !opts.session.execute.is_empty() {
         // Add virtio-serial devices for execute output and status
         // These will be created inside the container at /run/execute-output/
         all_serial_devices.push("execute:/run/execute-output/execute-output.txt".to_string());
@@ -1031,8 +1067,12 @@ fn prepare_run_command_with_temp(
         cmd.args(["-e", &format!("BOOTC_DISK_FILES={}", disk_specs)]);
     }
 
-    let entrypoint = opts.debug_entrypoint.as_deref().unwrap_or(ENTRYPOINT);
-    cmd.args(["--", &opts.image, entrypoint]);
+    let entrypoint = opts
+        .session
+        .debug_entrypoint
+        .as_deref()
+        .unwrap_or(ENTRYPOINT);
+    cmd.args(["--", &opts.vm.image, entrypoint]);
 
     Ok((cmd, td, journal_fds))
 }
@@ -1586,7 +1626,7 @@ pub(crate) async fn run_impl(opts: RunEphemeralOpts) -> Result<()> {
                 debug: false,
                 readonly: is_readonly,
                 log_file: Some(format!("/run/virtiofsd-{}.log", mount_name_str).into()),
-                virtiofsd_binary: opts.common.virtiofsd_binary.as_deref().map(Into::into),
+                virtiofsd_binary: opts.vm.common.virtiofsd_binary.as_deref().map(Into::into),
             };
             additional_mounts.push((virtiofsd_config, tag.clone()));
 
@@ -1641,8 +1681,8 @@ pub(crate) async fn run_impl(opts: RunEphemeralOpts) -> Result<()> {
     // Inject the journal streaming unit when either --output=journal or
     // --log-dir with journal stream is requested.  The guest always streams JSON;
     // the host converts JSON→plain-text for stdout as needed.
-    let wants_journal_stream = opts.common.output == OutputMode::Journal
-        || opts.common.log_dir.as_ref().map_or(false, |d| d.journal);
+    let wants_journal_stream = opts.vm.common.output == OutputMode::Journal
+        || opts.vm.common.log_dir.as_ref().map_or(false, |d| d.journal);
     if wants_journal_stream {
         let encoded_journal = data_encoding::BASE64.encode(JOURNAL_STREAM_UNIT.as_bytes());
         mount_unit_smbios_creds.push(format!(
@@ -1665,7 +1705,7 @@ pub(crate) async fn run_impl(opts: RunEphemeralOpts) -> Result<()> {
     }
 
     // Create execute units via SMBIOS credentials if needed
-    match opts.common.execute.as_slice() {
+    match opts.session.execute.as_slice() {
         [] => {}
         elts => {
             let mut service_content = format!(
@@ -1738,15 +1778,15 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     // Always log virtiofsd output for debugging
     main_virtiofsd_config.log_file = Some("/run/virtiofsd.log".into());
     main_virtiofsd_config.virtiofsd_binary =
-        opts.common.virtiofsd_binary.as_deref().map(Into::into);
+        opts.vm.common.virtiofsd_binary.as_deref().map(Into::into);
 
     std::fs::create_dir_all(CONTAINER_STATEDIR)?;
 
     // Configure qemu for direct kernel boot
     debug!("Configuring QEMU for direct kernel boot");
     let mut qemu_config = crate::qemu::QemuConfig::new_direct_boot(
-        opts.common.memory_mb()?,
-        opts.common.vcpus()?,
+        opts.vm.common.memory_mb()?,
+        opts.vm.common.vcpus()?,
         "/run/qemu/kernel".to_string(),
         "/run/qemu/initramfs".to_string(),
         main_virtiofsd_config.socket_path.clone(),
@@ -1757,7 +1797,7 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     let vsock_enabled = !vsock_force_disabled && qemu_config.enable_vsock().is_ok();
 
     // Handle SSH key generation and credential injection
-    if opts.common.ssh_keygen {
+    if opts.session.ssh_keygen {
         let key_pair = crate::ssh::generate_default_keypair()?;
         let pubkey = std::fs::read_to_string(key_pair.public_key_path.as_path())?;
         let credential_path = Utf8Path::new(SSH_CREDENTIAL_PATH);
@@ -1796,7 +1836,7 @@ StandardOutput=file:/dev/virtio-ports/executestatus
     .map(ToOwned::to_owned)
     .collect::<Vec<_>>();
 
-    if opts.common.console {
+    if opts.session.console {
         kernel_cmdline.push("console=hvc0".to_string());
     }
     if cloudinit {
@@ -1814,18 +1854,18 @@ StandardOutput=file:/dev/virtio-ports/executestatus
 
     // Add Ignition platform kernel argument if Ignition config is specified
     // This tells Ignition which platform it's running on and where to find the config
-    if opts.ignition_config.is_some() {
+    if opts.vm.ignition_config.is_some() {
         kernel_cmdline.push("ignition.platform.id=qemu".to_string());
     }
 
-    kernel_cmdline.extend(opts.kernel_args.clone());
+    kernel_cmdline.extend(opts.vm.kernel_args.clone());
     qemu_config.set_kernel_cmdline(kernel_cmdline);
 
     // Add Ignition config if specified
     // Different architectures require different methods (per FCOS docs):
     // - x86_64/aarch64: fw_cfg
     // - s390x/ppc64le: virtio-blk with serial "ignition"
-    if opts.ignition_config.is_some() {
+    if opts.vm.ignition_config.is_some() {
         let ignition_path = Utf8Path::new(IGNITION_CONFIG_MOUNT_PATH);
         if !ignition_path.exists() {
             return Err(eyre!(
@@ -1862,7 +1902,7 @@ StandardOutput=file:/dev/virtio-ports/executestatus
 
     // TODO allocate unlinked unnamed file and pass via fd
     let mut tmp_swapfile = None;
-    if let Some(size) = opts.add_swap {
+    if let Some(size) = opts.vm.add_swap {
         let size = utils::parse_size(&size)?;
         debug!("Allocating swap: {size}");
         let mut tmpf = tempfile::NamedTempFile::new_in("/var/tmp")?;
@@ -1968,7 +2008,7 @@ Options=
         }
     }
 
-    qemu_config.set_console(opts.common.console);
+    qemu_config.set_console(opts.session.console);
 
     // Set serial console log path if provided via --log-dir=console=...
     // The host bound-mounted the parent directory; BCVK_CONSOLE_PATH is the
@@ -2000,10 +2040,10 @@ Options=
             .into();
         debug!("Added virtio-serial pipes for journal streaming (real-root + initrd)");
 
-        let stdout_wants_journal = opts.common.output == OutputMode::Journal;
+        let stdout_wants_journal = opts.vm.common.output == OutputMode::Journal;
 
         // Parse BCVK_JOURNAL_FDS=fd1,fd2 to reconstruct the two host file writers.
-        let wants_journal_file = opts.common.log_dir.as_ref().map_or(false, |d| d.journal);
+        let wants_journal_file = opts.vm.common.log_dir.as_ref().map_or(false, |d| d.journal);
         let (file_writer, initrd_file_writer): (Option<tokio::fs::File>, Option<tokio::fs::File>) =
             if wants_journal_file {
                 use std::os::unix::io::FromRawFd as _;
@@ -2105,13 +2145,13 @@ Options=
     // This fixes DNS resolution issues when QEMU runs inside containers.
     // QEMU's slirp reads /etc/resolv.conf from the container's network namespace,
     // and podman properly sets it up using --dns instead of relying on bridge DNS.
-    if let Some(ref dns_servers) = opts.host_dns_servers {
+    if let Some(ref dns_servers) = opts.vm.host_dns_servers {
         debug!("DNS servers configured for QEMU slirp: {:?}", dns_servers);
     } else {
         warn!("No host DNS servers available, QEMU slirp will use container's resolv.conf which may not work");
     }
 
-    if opts.common.ssh_keygen {
+    if opts.session.ssh_keygen {
         qemu_config.enable_ssh_access(None); // Use default port 2222
         debug!("Enabled SSH port forwarding: host port 2222 -> guest port 22");
     }
@@ -2124,7 +2164,7 @@ Options=
         qemu_config.add_virtiofs(virtiofs_config, &tag);
     }
 
-    let exec_pipes = if !opts.common.execute.is_empty() {
+    let exec_pipes = if !opts.session.execute.is_empty() {
         let execute_pipefd: File = qemu_config.add_virtio_serial_pipe("execute")?.into();
         let status_pipefd: File = qemu_config.add_virtio_serial_pipe("executestatus")?.into();
         Some((execute_pipefd, status_pipefd))
@@ -2247,6 +2287,46 @@ Options=
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entrypoint_config_round_trip() {
+        let mut opts = RunEphemeralOpts::try_parse_from([
+            "run",
+            "--console",
+            "--debug",
+            "--execute",
+            "true",
+            "-K",
+            "--debug-entrypoint",
+            "bash",
+            "-t",
+            "-i",
+            "-d",
+            "--rm",
+            "--name",
+            "vm",
+            "--network",
+            "host",
+            "--label",
+            "k=v",
+            "--env",
+            "A=B",
+            "img",
+        ])
+        .unwrap();
+        opts.vm.host_dns_servers = Some(vec!["192.0.2.1".into()]);
+        // This is the BCK_CONFIG producer/consumer boundary, not clap flattening.
+        let config = serde_json::to_value(&opts).unwrap();
+        assert_eq!(config["image"], "img");
+        assert_eq!(config["session"]["console"], true);
+        assert_eq!(config["session"]["ssh_keygen"], true);
+        assert_eq!(config["session"]["execute"], serde_json::json!(["true"]));
+        assert_eq!(config["podman"]["detach"], true);
+        assert_eq!(config["container"]["network"], "host");
+        assert_eq!(config["host_dns_servers"], serde_json::json!(["192.0.2.1"]));
+        let decoded: RunEphemeralOpts = serde_json::from_value(config.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), config);
+    }
 
     #[test]
     fn test_is_zstd_efi_zboot() -> Result<()> {

@@ -162,6 +162,10 @@ Run a bootable container as a persistent VM
 
     Path to Ignition config file (JSON format) for first-boot provisioning
 
+**--virtiofsd**=*VIRTIOFSD_BINARY*
+
+    Path to virtiofsd binary (overrides auto-detection for disk creation)
+
 **--console-log**=*CONSOLE_LOG*
 
     Log virtio console (OS/journald on hvc0) to this file (created if absent)

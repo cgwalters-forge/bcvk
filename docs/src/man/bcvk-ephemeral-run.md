@@ -64,26 +64,9 @@ This design allows bcvk to provide VM-like isolation and boot behavior while lev
 
     Number of vCPUs (overridden by --itype if specified)
 
-**--console**
-
-    Connect the QEMU console to the container's stdio (visible via podman logs/attach)
-    Add **-i -t** to send keyboard input to the guest console.
-
-**--debug**
-
-    Enable debug mode (drop to shell instead of running QEMU)
-
 **--virtio-serial-out**=*NAME:FILE*
 
     Add virtio-serial device with output to file (format: name:/path/to/file)
-
-**--execute**=*EXECUTE*
-
-    Execute command inside VM via systemd and capture output
-
-**-K**, **--ssh-keygen**
-
-    Generate SSH keypair and inject via systemd credentials
 
 **--virtiofsd**=*VIRTIOFSD_BINARY*
 
@@ -103,26 +86,6 @@ This design allows bcvk to provide VM-like isolation and boot behavior while lev
 
     Write VM log streams to files in DIR
 
-**-t**, **--tty**
-
-    Allocate a pseudo-TTY for container
-
-**-i**, **--interactive**
-
-    Keep STDIN open for container
-
-**-d**, **--detach**
-
-    Run container in background
-
-**--rm**
-
-    Automatically remove container when it exits
-
-**--name**=*NAME*
-
-    Assign a name to the container
-
 **--network**=*NETWORK*
 
     Configure the network for the container
@@ -134,10 +97,6 @@ This design allows bcvk to provide VM-like isolation and boot behavior while lev
 **-e**, **--env**=*ENV*
 
     Set environment variables in the container (key=value)
-
-**--debug-entrypoint**=*DEBUG_ENTRYPOINT*
-
-    Do not run the default entrypoint directly, but instead invoke the provided command (e.g. `bash`)
 
 **--bind**=*HOST_PATH[:NAME]*
 
@@ -170,6 +129,46 @@ This design allows bcvk to provide VM-like isolation and boot behavior while lev
 **--ignition**=*IGNITION_CONFIG*
 
     Path to Ignition config file (JSON format) to inject via fw_cfg
+
+**-t**, **--tty**
+
+    Allocate a pseudo-TTY for container
+
+**-i**, **--interactive**
+
+    Keep STDIN open for container
+
+**-d**, **--detach**
+
+    Run container in background
+
+**--rm**
+
+    Automatically remove container when it exits
+
+**--name**=*NAME*
+
+    Assign a name to the container
+
+**--console**
+
+    Connect the QEMU console to the container's stdio (visible via podman logs/attach)
+
+**--debug**
+
+    Enable debug mode (drop to shell instead of running QEMU)
+
+**--execute**=*EXECUTE*
+
+    Execute command inside VM via systemd and capture output
+
+**-K**, **--ssh-keygen**
+
+    Generate SSH keypair and inject via systemd credentials
+
+**--debug-entrypoint**=*DEBUG_ENTRYPOINT*
+
+    Do not run the default entrypoint directly, but instead invoke the provided command (e.g. `bash`)
 
 <!-- END GENERATED OPTIONS -->
 

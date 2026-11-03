@@ -245,38 +245,44 @@ impl BcvkService {
                 .transpose()?;
 
             let run_opts = RunEphemeralOpts {
-                image,
-                common: CommonVmOpts {
-                    itype,
-                    memory: crate::common_opts::MemoryOpts {
-                        memory: opts
-                            .memory
-                            .unwrap_or_else(|| crate::common_opts::DEFAULT_MEMORY_USER_STR.into()),
+                vm: crate::run_ephemeral::EphemeralVmOpts {
+                    image,
+                    common: CommonVmOpts {
+                        itype,
+                        memory: crate::common_opts::MemoryOpts {
+                            memory: opts.memory.unwrap_or_else(|| {
+                                crate::common_opts::DEFAULT_MEMORY_USER_STR.into()
+                            }),
+                        },
+                        vcpus: opts.vcpus,
+                        ..Default::default()
                     },
-                    vcpus: opts.vcpus,
-                    console: opts.console.unwrap_or(false),
-                    ssh_keygen: opts.ssh_keygen.unwrap_or(false),
-                    ..Default::default()
+                    container: crate::run_ephemeral::CommonContainerOpts {
+                        label: opts.label.unwrap_or_default(),
+                        network: opts.network,
+                        env: opts.env.unwrap_or_default(),
+                    },
+                    bind_mounts: opts.bind.unwrap_or_default(),
+                    ro_bind_mounts: opts.ro_bind.unwrap_or_default(),
+                    systemd_units_dir: None,
+                    bind_storage_ro: false,
+                    add_swap: opts.add_swap,
+                    mount_disk_files: opts.mount_disk_files.unwrap_or_default(),
+                    kernel_args: opts.kargs.unwrap_or_default(),
+                    ignition_config: None,
+                    host_dns_servers: None,
                 },
                 podman: CommonPodmanOptions {
                     detach: true,
                     name: opts.name,
-                    label: opts.label.unwrap_or_default(),
-                    network: opts.network,
-                    env: opts.env.unwrap_or_default(),
                     rm: opts.rm.unwrap_or(false),
                     ..Default::default()
                 },
-                debug_entrypoint: None,
-                bind_mounts: opts.bind.unwrap_or_default(),
-                ro_bind_mounts: opts.ro_bind.unwrap_or_default(),
-                systemd_units_dir: None,
-                bind_storage_ro: false,
-                add_swap: opts.add_swap,
-                mount_disk_files: opts.mount_disk_files.unwrap_or_default(),
-                kernel_args: opts.kargs.unwrap_or_default(),
-                ignition_config: None,
-                host_dns_servers: None,
+                session: crate::run_ephemeral::VmSessionOpts {
+                    console: opts.console.unwrap_or(false),
+                    ssh_keygen: opts.ssh_keygen.unwrap_or(false),
+                    ..Default::default()
+                },
             };
 
             crate::run_ephemeral::run_detached(run_opts)

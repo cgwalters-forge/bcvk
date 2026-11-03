@@ -95,25 +95,9 @@ The installation process:
 
     Number of vCPUs (overridden by --itype if specified)
 
-**--console**
-
-    Connect the QEMU console to the container's stdio (visible via podman logs/attach)
-
-**--debug**
-
-    Enable debug mode (drop to shell instead of running QEMU)
-
 **--virtio-serial-out**=*NAME:FILE*
 
     Add virtio-serial device with output to file (format: name:/path/to/file)
-
-**--execute**=*EXECUTE*
-
-    Execute command inside VM via systemd and capture output
-
-**-K**, **--ssh-keygen**
-
-    Generate SSH keypair and inject via systemd credentials
 
 **--virtiofsd**=*VIRTIOFSD_BINARY*
 

@@ -470,13 +470,11 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
     let storage_path = opts.get_storage_path()?;
 
     // Debug logging for installation configuration
-    if opts.additional.common.debug {
-        debug!("Using container storage: {:?}", storage_path);
-        debug!("Installing to target disk: {:?}", opts.target_disk);
-        debug!("Filesystem: {:?}", opts.install.filesystem);
-        if let Some(ref root_size) = opts.install.root_size {
-            debug!("Root size: {}", root_size);
-        }
+    debug!("Using container storage: {:?}", storage_path);
+    debug!("Installing to target disk: {:?}", opts.target_disk);
+    debug!("Filesystem: {:?}", opts.install.filesystem);
+    if let Some(ref root_size) = opts.install.root_size {
+        debug!("Root size: {}", root_size);
     }
 
     let disk_size = opts.calculate_disk_size()?;
@@ -523,9 +521,7 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
     let bootc_install_command = opts.generate_bootc_install_command(disk_size)?;
 
     // Phase 4: Ephemeral VM configuration
-    let mut common_opts = opts.additional.common.clone();
-    // Enable SSH key generation for SSH-based installation
-    common_opts.ssh_keygen = true;
+    let common_opts = opts.additional.common.clone();
 
     let tty = std::io::stdout().is_terminal();
 
@@ -550,32 +546,41 @@ pub fn run(mut opts: ToDiskOpts) -> Result<RunOutcome> {
     // - Attach target disk via virtio-blk
     // - Boot to bcvk-to-disk.target instead of default.target
     let ephemeral_opts = RunEphemeralOpts {
-        host_dns_servers: None,
-        image: opts.get_installer_image().to_string(),
-        common: common_opts,
+        vm: crate::run_ephemeral::EphemeralVmOpts {
+            host_dns_servers: None,
+            image: opts.get_installer_image().to_string(),
+            common: common_opts,
+            container: crate::run_ephemeral::CommonContainerOpts {
+                label: opts.additional.label,
+                ..Default::default()
+            },
+            // Workaround for https://github.com/containers/container-libs/issues/144#issuecomment-3300424410
+            // Basically containers-libs allocates a tempfile for a whole serialization of a layer as a tarball
+            // when fetching, so we need enough memory to do so.
+            add_swap: Some(format!("{disk_size}")),
+            bind_mounts: Vec::new(),    // No additional bind mounts needed
+            ro_bind_mounts: Vec::new(), // No additional ro bind mounts needed
+            systemd_units_dir: Some(units_dir.path().to_string_lossy().to_string()),
+            bind_storage_ro: true, // Mount host container storage read-only
+            mount_disk_files: vec![format!(
+                "{}:output:{}",
+                opts.target_disk,
+                opts.additional.format.as_str()
+            )], // Attach target disk
+            kernel_args: vec!["systemd.unit=bcvk-to-disk.target".to_string()],
+            ignition_config: None,
+        },
         podman: crate::run_ephemeral::CommonPodmanOptions {
             rm: true,     // Clean up container after installation
             detach: true, // Run in detached mode for SSH approach
             tty,
-            label: opts.additional.label,
             ..Default::default()
         },
-        // Workaround for https://github.com/containers/container-libs/issues/144#issuecomment-3300424410
-        // Basically containers-libs allocates a tempfile for a whole serialization of a layer as a tarball
-        // when fetching, so we need enough memory to do so.
-        add_swap: Some(format!("{disk_size}")),
-        bind_mounts: Vec::new(),    // No additional bind mounts needed
-        ro_bind_mounts: Vec::new(), // No additional ro bind mounts needed
-        systemd_units_dir: Some(units_dir.path().to_string_lossy().to_string()),
-        bind_storage_ro: true, // Mount host container storage read-only
-        mount_disk_files: vec![format!(
-            "{}:output:{}",
-            opts.target_disk,
-            opts.additional.format.as_str()
-        )], // Attach target disk
-        kernel_args: vec!["systemd.unit=bcvk-to-disk.target".to_string()],
-        ignition_config: None,
-        debug_entrypoint: None,
+        session: crate::run_ephemeral::VmSessionOpts {
+            // Enable SSH key generation for SSH-based installation
+            ssh_keygen: true,
+            ..Default::default()
+        },
     };
 
     // Phase 5: SSH-based VM configuration and execution
